@@ -67,6 +67,9 @@ test("vibecodr bin cross-routes vc-tools commands through the legacy dispatcher"
   assert.match(result.stdout, /browser snapshot <https-url> \[--local\|--out \.\/proof\]/);
   assert.doesNotMatch(result.stdout, /browser snapshot <https-url> .*instructions/);
   assert.match(result.stdout, /browser notes <https-url> --note <text> \[--local\|--out \.\/proof\]/);
+  assert.match(result.stdout, /browser session open <https-url>/);
+  assert.match(result.stdout, /browser session click <sessionId> --selector <css>/);
+  assert.match(result.stdout, /browser session auth <sessionId>/);
   assert.doesNotMatch(result.stdout, /browser ask <https-url>/);
 });
 

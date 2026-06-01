@@ -208,6 +208,29 @@ captures page state and saves/returns the artifact, but it does not ask a model
 for an answer and does not accept `--instructions`. The `browser notes` command
 stores a caller note with the same snapshot artifact.
 
+`browser session <open|observe|goto|click|type|scroll|wait|live|auth|close>` is the real
+Agent Browser control lane. `open` creates a hosted Cloudflare Browser Run
+session for a public HTTPS page, stores the provider session id behind the
+Vibecodr job id, returns the first screenshot proof and page state, and keeps
+the browser alive behind the hosted boundary. `observe` reconnects to that
+provider session and returns a fresh screenshot plus page text/links. Action
+commands reconnect, perform one bounded browser action, and return a new
+observation. `live` creates a short-lived Vibecodr URL for the main
+`/agent-browser/live/:sessionId` page so a human can watch the agent work
+without pausing it. `auth` opens the same live page with human control already
+active for login, MFA/CAPTCHA, or another sensitive browser-only step; the
+human can then give control back to the same hosted browser. The live page
+can also end the hosted browser through the same token-gated Worker authority,
+which closes the provider session and records browser-minute usage. The live
+page defaults to Cloudflare Live View `mode=tab`; callers can request the
+DevTools inspector with `--debug`, `--view devtools`, or `view=devtools` on
+token-gated handoff URLs. While human control is active, agent observe/action
+controls are paused; `auth-complete` resumes controls, and `auth-revoke` ends
+only the live link / human handoff state when a caller needs that narrower
+behavior. `close` closes the provider browser and records browser-minute usage.
+This lane is distinct from `browser snapshot`: snapshot remains the no-prompt
+proof capture path, while session commands are explicit live browser control.
+
 Agent Computer command payloads default to public HTTP(S) network availability
 for paid hosted runs. The CLI also accepts `--network public` and
 `--network off`; no user flag enables private, local, metadata, or internal
@@ -297,6 +320,18 @@ Primary agent tool names:
 - `browser.pdf` -> `browser.render_pdf`
 - `browser.crawl` -> `browser.crawl_site`
 - `browser.snapshot` -> `browser.agent_task`
+- `browser.session.open` -> `browser.session_open`
+- `browser.session.observe` -> `browser.session_observe`
+- `browser.session.goto` -> `browser.session_navigate`
+- `browser.session.click` -> `browser.session_click`
+- `browser.session.type` -> `browser.session_type`
+- `browser.session.scroll` -> `browser.session_scroll`
+- `browser.session.wait` -> `browser.session_wait`
+- `browser.session.auth.request` -> `browser.session_auth_request`
+- `browser.session.auth.status` -> `browser.session_auth_status`
+- `browser.session.auth.complete` -> `browser.session_auth_complete`
+- `browser.session.auth.revoke` -> `browser.session_auth_revoke`
+- `browser.session.close` -> `browser.session_close`
 - `computer.run` -> `sandbox.run_command`
 - `computer.test` -> `sandbox.run_tests`
 - `proof.get` -> `artifact.get`
@@ -314,6 +349,18 @@ The CLI validates and submits only these v1 capability names:
 - `browser.render_pdf`
 - `browser.crawl_site`
 - `browser.agent_task`
+- `browser.session_open`
+- `browser.session_observe`
+- `browser.session_navigate`
+- `browser.session_click`
+- `browser.session_type`
+- `browser.session_scroll`
+- `browser.session_wait`
+- `browser.session_auth_request`
+- `browser.session_auth_status`
+- `browser.session_auth_complete`
+- `browser.session_auth_revoke`
+- `browser.session_close`
 - `sandbox.run_command`
 - `sandbox.run_tests`
 - `artifact.create`
@@ -333,6 +380,18 @@ The CLI and hosted API also accept documented aliases for agent/human ergonomics
 - `browser.crawl` -> `browser.crawl_site`
 - `browser.agent` / `browser.session` -> `browser.agent_task`
 - `browser.snapshot` -> `browser.agent_task`
+- `browser.session.open` -> `browser.session_open`
+- `browser.session.observe` -> `browser.session_observe`
+- `browser.session.goto` / `browser.session.navigate` -> `browser.session_navigate`
+- `browser.session.click` -> `browser.session_click`
+- `browser.session.type` -> `browser.session_type`
+- `browser.session.scroll` -> `browser.session_scroll`
+- `browser.session.wait` -> `browser.session_wait`
+- `browser.session.auth` / `browser.session.auth.request` -> `browser.session_auth_request`
+- `browser.session.auth.status` -> `browser.session_auth_status`
+- `browser.session.auth.complete` -> `browser.session_auth_complete`
+- `browser.session.auth.revoke` -> `browser.session_auth_revoke`
+- `browser.session.close` -> `browser.session_close`
 - `computer.run` -> `sandbox.run_command`
 - `computer.test` / `computer.tests` -> `sandbox.run_tests`
 - `sandbox.run` -> `sandbox.run_command`
@@ -502,9 +561,10 @@ Browser mode policy:
 - Public web mode is the default. Agents can inspect, render, screenshot, make
   PDFs, extract markdown, and crawl public HTTPS targets, returning hosted
   artifacts.
-- Authenticated web mode is future Pro/beta only. A user must knowingly grant
-  access to a specific session, account, or site, with retention, recording,
-  consent, and audit policy settled before implementation.
+- Authenticated web work uses explicit live control. A user must knowingly take
+  over a specific Agent Browser session to sign in or steer, then give control
+  back; browser tools never accept raw cookies, credentials, auth headers,
+  storage state, sessions, or secrets.
 - Owned-surface mode is narrow and internal: Vibecodr-owned domains may
   recognize controlled Browser Run traffic so proof/testing flows are not
   blocked by our own WAF or bot controls.
@@ -520,7 +580,13 @@ The CLI performs pre-cost validation before API calls:
 - Browser URL targets must not contain credentials.
 - Browser tool input must not include cookies, credentials, authorization
   headers, custom auth headers, storage state, sessions, or secrets. The hosted
-  Worker rejects those fields before provider execution.
+  Worker rejects those fields before provider execution. Authenticated browser
+  work must use the Agent Browser live-control route: Vibecodr mints a short-lived
+  tokenized app URL (`/agent-browser/live/{jobId}#token=...` when configured,
+  with `/browser/handoff/{jobId}?token=...` kept as the Worker fallback and
+  `/agent-browser/handoff/{jobId}` kept as an app compatibility route), stores
+  only a token hash in D1, refreshes Cloudflare Live View URLs server-side, and
+  keeps Cloudflare API tokens/provider session ids out of normal API/job output.
 - Browser URL targets must not be localhost, private IP, loopback, link-local,
   multicast, unspecified, IPv4-mapped IPv6, NAT64, 6to4, or obvious internal
   hostnames.
@@ -582,7 +648,9 @@ Hosted safety defaults required by this contract:
   exchange rejects keys without `vc-tools:use` or `vc-tools:*`.
 - Live hosted work records, artifacts, usage rows, retention policies, and audit rows are scoped
   to the authenticated actor.
-- No authenticated third-party browsing by default.
+- No ambient authenticated third-party browsing by default. Authenticated
+  Agent Browser continuation requires explicit human control, completion, and
+  revocation controls.
 - Paid sandbox public HTTP(S) egress is available by default, with private,
   local, link-local, metadata, and internal destinations denied.
 - No browser recording by default.

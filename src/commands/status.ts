@@ -106,6 +106,37 @@ function statusNextStep(credentialSurfaces: CredentialSurfaceStatus[]): string {
   return "Next: run `vibecodr browser read https://example.com` or `vibecodr mcp tools`.";
 }
 
+function mcpSessionDetailLines(sessionState: string, expiresAt: string | undefined): string[] {
+  const lines = [`MCP session: ${formatMcpSessionState(sessionState, expiresAt)}`];
+  if (!expiresAt) {
+    lines.push("MCP access token: not logged in");
+    return lines;
+  }
+  const expiresMs = Date.parse(expiresAt);
+  const isExpired = Number.isFinite(expiresMs) && expiresMs <= Date.now();
+  if (isExpired) {
+    lines.push(
+      sessionState === "refreshable"
+        ? `MCP access token expired: ${expiresAt} (OAuth refresh is available; the next MCP Gateway call will refresh it).`
+        : `MCP access token expired: ${expiresAt}`
+    );
+    return lines;
+  }
+  lines.push(`MCP access token expires: ${expiresAt}`);
+  return lines;
+}
+
+function formatMcpSessionState(sessionState: string, expiresAt: string | undefined): string {
+  if (sessionState !== "refreshable" || !expiresAt) {
+    return sessionState;
+  }
+  const expiresMs = Date.parse(expiresAt);
+  if (Number.isFinite(expiresMs) && expiresMs <= Date.now()) {
+    return "refreshable (access token expired; OAuth refresh is available)";
+  }
+  return sessionState;
+}
+
 export async function runStatusCommand(args: string[], context: CommandContext): Promise<void> {
   if (showHelpIfRequested(args, context, "Usage: vibecodr status [--probe] [--show-installs]")) return;
   const { flags } = parseFlags(args, {
@@ -150,9 +181,8 @@ export async function runStatusCommand(args: string[], context: CommandContext):
     "Details:",
     `Profile: ${profileName}`,
     `MCP server: ${serverUrl}`,
-    `MCP session: ${sessionState}`,
+    ...mcpSessionDetailLines(sessionState, session?.expiresAt),
     `Registration mode: ${session?.registrationMode || profile.registrationMode}`,
-    `MCP session expires: ${session?.expiresAt || "not logged in"}`,
     ...(flags["show-installs"] ? [`Managed installs: ${installs.length}`] : []),
     ...(flags["show-installs"]
       ? installs.map((install) => `Install: ${install.client} ${install.scope} ${install.location} [${install.status}]`)

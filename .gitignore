@@ -23,4 +23,5 @@ tmp/
 tmp-*/
 *scratch*
 .vc-tools-test/
+.vibecodr/
 vibecodr-proof/

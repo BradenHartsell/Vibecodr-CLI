@@ -116,9 +116,22 @@ Prints (`--print`) the MCP connection details for the hosted Agent Computer. The
 - `browser crawl <https-url> [--max-pages n] [--max-depth n] [--local|--out ./proof]`
 - `browser snapshot <https-url> [--local|--out ./proof]`
 - `browser notes <https-url> --note <text> [--local|--out ./proof]`
+- `browser session open <https-url> [--timeout-ms <ms>] [--idle-timeout-ms <ms>]`
+- `browser session observe <sessionId>`
+- `browser session goto <sessionId> <https-url>`
+- `browser session click <sessionId> --selector <css>`
+- `browser session type <sessionId> --selector <css> --text <text>`
+- `browser session scroll <sessionId> [--delta-y 800]`
+- `browser session wait <sessionId> [--ms 1000]`
+- `browser session live <sessionId> [--no-open] [--debug|--view devtools]`
+- `browser session auth <sessionId> [--no-open] [--debug|--view devtools]`
+- `browser session auth-status <sessionId>`
+- `browser session auth-complete <sessionId>`
+- `browser session auth-revoke <sessionId>`
+- `browser session close <sessionId>`
 
 Public HTTPS URLs only. Localhost, private network ranges, URL credentials, and internal hostnames are blocked before any hosted work is submitted. `--no-wait` returns immediately with a `jobId` you can follow via `vibecodr work follow`. `--details` includes capability metadata in the response.
-Use `--local` to save the completed output into `./vibecodr-proof` automatically, or `--out` when you want to choose the destination. `browser snapshot` captures page state; it does not prompt an agent or model. `browser notes` saves your note with the snapshot.
+Use `--local` to save completed one-shot outputs into `./vibecodr-proof` automatically, or `--out` when you want to choose the destination. Automatic output saves are workspace-bounded; if `--out` points outside the current workspace, Vibecodr writes to `./.vibecodr/browser-artifacts/<run>` instead and returns a warning. `browser snapshot` captures page state; it does not prompt an agent or model. `browser notes` saves your note with the snapshot. `browser session` opens a hosted Agent Browser that the agent can observe and control until it is closed or idle; each observe/action returns fresh screenshot proof. `browser session live` opens the watch page without pausing the agent. `browser session auth` opens the same live page with human control already active for login, MFA, CAPTCHA, or another human-only step before handing the same hosted browser back. The live page lets the owner watch, take over, give back, or end the browser. It defaults to the plain browser tab; add `--debug` or `--view devtools` only when an agent/developer needs the inspector panel.
 
 ## Hosted computer (H)
 

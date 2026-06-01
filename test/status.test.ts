@@ -155,3 +155,59 @@ test("status suggests MCP Gateway login only after Agent Computer is connected",
   assert.ok(humanLines.some((line) => line.includes("MCP Gateway: not authenticated")));
   assert.ok(humanLines.some((line) => line.includes("Next: run `vibecodr login` only if")));
 });
+
+test("status explains stale MCP access token expiry when OAuth can refresh", async () => {
+  const humanLines: string[] = [];
+  await runStatusCommand([], {
+    globalOptions: {
+      profile: "default",
+      json: false,
+      verbose: false,
+      nonInteractive: false
+    },
+    output: {
+      success(_value: Record<string, unknown>, lines: string[]) {
+        humanLines.push(...lines);
+      }
+    },
+    tokenManager: {
+      resolveProfile: async () => ({
+        profileName: "default",
+        profile: {
+          serverUrl: "https://openai.vibecodr.space/mcp",
+          browserMode: "print",
+          registrationMode: "auto",
+          defaultInstallScope: "user",
+          logLevel: "normal"
+        },
+        serverUrl: "https://openai.vibecodr.space/mcp"
+      }),
+      getSession: async () => ({
+        accessToken: "redacted-test-token",
+        refreshToken: "redacted-refresh-token",
+        expiresAt: "2026-05-27T00:00:00.000Z",
+        registrationMode: "auto"
+      }),
+      sessionState: () => "refreshable"
+    },
+    configStore: {} as never,
+    secretStore: {} as never,
+    runtimeClient: {} as never,
+    credentialBroker: {
+      getCredentialForEndpoint: async (endpoint: string) => endpoint === "openai.vibecodr.space/mcp"
+        ? {
+            endpoint: "openai.vibecodr.space/mcp",
+            kind: "oauth",
+            value: "redacted-test-token",
+            serviceId: "@vibecodr/mcp"
+          }
+        : undefined
+    }
+  } as never);
+
+  assert.ok(humanLines.some((line) => line.includes("MCP Gateway: signed in via OAuth")));
+  assert.ok(humanLines.some((line) => line.includes("MCP session: refreshable (access token expired; OAuth refresh is available)")));
+  assert.ok(humanLines.some((line) => line.includes("MCP access token expired: 2026-05-27T00:00:00.000Z")));
+  assert.ok(humanLines.some((line) => line.includes("the next MCP Gateway call will refresh it")));
+  assert.equal(humanLines.some((line) => line.includes("MCP session expires:")), false);
+});

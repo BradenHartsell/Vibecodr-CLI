@@ -90,7 +90,7 @@
           "concurrentSandboxJobs": 2
         },
         "posture": {
-          "authenticatedBrowsing": "disabled",
+          "authenticatedBrowsing": "human-handoff-beta",
           "browserRecording": "disabled",
           "sandboxNetwork": "public-egress-private-deny",
           "crawl": "disabled-or-limited",
@@ -137,7 +137,7 @@
           "concurrentSandboxJobs": 2
         },
         "posture": {
-          "authenticatedBrowsing": "allowlisted-beta",
+          "authenticatedBrowsing": "human-handoff-allowlisted-beta",
           "browserRecording": "opt-in",
           "sandboxNetwork": "public-egress-private-deny",
           "crawl": "add-on-or-limited",

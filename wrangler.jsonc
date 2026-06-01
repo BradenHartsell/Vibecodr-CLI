@@ -4,6 +4,7 @@
   "main": "src/hosted/worker.ts",
   "compatibility_date": "2026-05-11",
   "compatibility_flags": ["nodejs_compat"],
+  "logpush": true,
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
@@ -19,6 +20,7 @@
   },
   "vars": {
     "VC_TOOLS_PUBLIC_BASE_URL": "https://tools.vibecodr.space",
+    "VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL": "https://vibecodr.space",
     "VC_TOOLS_PROVIDER_MODE": "live",
     "VC_TOOLS_PLAN_NAME": "Creator",
     "VC_TOOLS_HOSTED_ACCOUNT_SOFT_CAP": "24",

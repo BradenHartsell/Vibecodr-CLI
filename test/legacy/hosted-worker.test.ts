@@ -19,6 +19,7 @@ const baseEnv = {
   VC_TOOLS_PROVIDER_MODE: "contract" as const
 };
 
+const HANDOFF_TOKEN_HEADER = "x-vibecodr-handoff-token";
 const fakeSecret = (...parts: string[]) => parts.join("_");
 const bearerHeader = (token: string) => ["Bearer", token].join(" ");
 const browserRunApiToken = () => fakeSecret("cf", "quick", "action", "token");
@@ -2043,7 +2044,7 @@ test("hosted queue handler bounds large-page Browser Run Quick Action timeouts",
     globalThis.fetch = originalFetch;
   }
 
-  assert.equal(quickActionCalls.length, cases.length);
+  assert.equal(quickActionCalls.length, cases.length + 1);
   for (const item of cases) {
     const call = quickActionCalls.find((candidate) => candidate.endpoint === item.endpoint);
     assert.ok(call, item.endpoint);
@@ -2057,8 +2058,86 @@ test("hosted queue handler bounds large-page Browser Run Quick Action timeouts",
       assert.equal("actionTimeout" in call.body, false);
     }
   }
+  const scrapeCall = quickActionCalls.find((candidate) => candidate.endpoint === "scrape");
+  assert.ok(scrapeCall);
+  assert.equal(scrapeCall.body.url, "https://example.com/large");
+  assert.equal(Array.isArray(scrapeCall.body.elements), true);
   assert.equal(env.ARTIFACTS.puts.length, cases.length);
   assert.equal(env.DB.runs.filter((run) => run.sql.includes("UPDATE jobs SET status = 'completed'")).length, cases.length);
+});
+
+test("hosted queue handler narrows Browser Run markdown reads to readable main content", async () => {
+  const env = fakeLiveEnv("quick-action-main-markdown-token");
+  const quickActionToken = browserRunApiToken();
+  env.VC_TOOLS_BROWSER_RUN_ACCOUNT_ID = "acct_123";
+  env.VC_TOOLS_BROWSER_RUN_API_TOKEN = quickActionToken;
+  const quickActionCalls: Array<{ endpoint: string; headers: Headers; body: Record<string, unknown> }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.startsWith("https://api.cloudflare.com/client/v4/accounts/acct_123/browser-rendering/")) {
+      const endpoint = new URL(url).pathname.split("/").pop() ?? "";
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      quickActionCalls.push({ endpoint, headers: new Headers(init?.headers), body });
+      if (endpoint === "scrape") {
+        return new Response(JSON.stringify({
+          success: true,
+          result: [
+            { selector: "main article", results: [{ text: "", html: "" }] },
+            {
+              selector: "article",
+              results: [{
+                text: "Workers routes traffic to a durable isolate and keeps deployment state readable for agents. The readable article body should win over the surrounding docs navigation, sidebars, and table-of-contents chrome.",
+                html: "<h1>Workers guide</h1><p>Workers routes traffic to a durable isolate and keeps deployment state readable for agents. The readable article body should win over the surrounding docs navigation, sidebars, and table-of-contents chrome.</p>"
+              }]
+            }
+          ]
+        }), { headers: { "content-type": "application/json", "x-browser-ms-used": "1200" } });
+      }
+      if (endpoint === "markdown") {
+        assert.equal(typeof body.html, "string");
+        assert.match(String(body.html), /data-vibecodr-read-root="article"/);
+        assert.doesNotMatch(String(body.html), /Sidebar/);
+        return new Response(JSON.stringify({
+          success: true,
+          result: "# Workers guide\n\nWorkers routes traffic to a durable isolate and keeps deployment state readable for agents."
+        }), { headers: { "content-type": "application/json", "x-browser-ms-used": "800" } });
+      }
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    await worker.queue?.({
+      messages: [{
+        body: {
+          id: "job_quick_action_main_markdown",
+          capability: "browser.extract_markdown",
+          input: { kind: "browser", url: "https://developers.cloudflare.com/workers/", timeoutMs: 60000, output: "markdown" },
+          enqueuedAt: new Date().toISOString(),
+          actorId: "usr_quick_action_main_markdown",
+          planName: "Creator",
+          retentionDays: 3,
+          reservedCredits: 1,
+          reservedBrowserSeconds: 60
+        }
+      }],
+      queue: "vc-tools-jobs",
+      retryAll() {},
+      ackAll() {}
+    } as MessageBatch, env as never, testExecutionContext());
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.deepEqual(quickActionCalls.map((call) => call.endpoint), ["scrape", "markdown"]);
+  assert.equal(quickActionCalls[0]?.headers.get("authorization"), bearerHeader(quickActionToken));
+  const markdown = new TextDecoder().decode(env.ARTIFACTS.puts[0]?.value as Uint8Array);
+  assert.match(markdown, /^Source: https:\/\/developers\.cloudflare\.com\/workers\//);
+  assert.match(markdown, /# Workers guide/);
+  assert.doesNotMatch(markdown, /Sidebar/);
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("UPDATE jobs SET status = 'completed'")), true);
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO usage_events") && run.values.includes("browser-minute") && run.values.includes(2000 / 60000)), true);
 });
 
 test("hosted queue handler closes Browser Sessions when large-page navigation times out", async () => {
@@ -2139,6 +2218,482 @@ test("hosted Browser Agent Workflow uses paid Browser Sessions and records closu
   assert.equal(env.DB.runs.some((run) => run.sql.includes("UPDATE jobs SET status = 'completed'") && String(run.values[0]).includes('"closureReason":"completed"')), true);
   assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO audit_events") && run.values.includes("tools.browser_agent.completed")), true);
   assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO usage_events") && run.values.includes("browser-minute")), true);
+});
+
+test("hosted worker opens a real Agent Browser session and returns screenshot proof", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-open-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_open" };
+  const state = await withMockLiveAgentBrowser(async (browserState) => {
+    const result = await withPublicDns(() => fetchWorker("https://tools.vibecodr.space/v1/browser/sessions", env, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer agent-browser-open-token",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        url: "https://example.com/",
+        timeoutMs: 1_200_000,
+        idleTimeoutMs: 600_000
+      })
+    }));
+
+    assert.equal(result.response.status, 201);
+    assert.match(String(result.body.id), /^job_/);
+    assert.equal((result.body.session as Record<string, unknown>).status, "running");
+    assert.equal((result.body.observation as Record<string, Record<string, unknown>>).screenshot.contentType, "image/png");
+    assert.equal(env.ARTIFACTS.puts.length, 1);
+    assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO jobs") && run.values.includes("browser.session_open")), true);
+    assert.equal(env.DB.runs.some((run) => run.sql.includes("UPDATE jobs SET result_json")), true);
+    const stateWrite = env.DB.runs.find((run) => run.sql.includes("UPDATE jobs SET result_json"));
+    const storedState = JSON.parse(String(stateWrite?.values[0] ?? "{}")) as Record<string, unknown>;
+    assert.equal(storedState.providerSessionId, "cf_browser_session_123");
+    return browserState;
+  });
+
+  assert.deepEqual(state.launchOptions, [{ keep_alive: 600_000 }]);
+  assert.deepEqual(state.navigations, ["https://example.com/"]);
+  assert.equal(state.disconnected, 1);
+  assert.equal(state.closed, 0);
+});
+
+test("hosted worker lets an agent act on and observe an open Agent Browser session", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-action-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_action" };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_action", "usr_agent_browser_action")
+  });
+
+  const state = await withMockLiveAgentBrowser(async (browserState) => {
+    const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_action/actions", env, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer agent-browser-action-token",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        action: "click",
+        selector: "button.start"
+      })
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal((result.body.action as Record<string, unknown>).action, "click");
+    assert.equal((result.body.observation as Record<string, Record<string, unknown>>).screenshot.contentType, "image/png");
+    assert.equal(env.ARTIFACTS.puts.length, 1);
+    assert.equal(env.DB.runs.some((run) => run.sql.includes("UPDATE jobs SET result_json")), true);
+    return browserState;
+  });
+
+  assert.deepEqual(state.connectedSessionIds, ["cf_browser_session_123"]);
+  assert.deepEqual(state.clicks, ["button.start"]);
+  assert.equal(state.disconnected, 1);
+  assert.equal(state.closed, 0);
+});
+
+test("hosted worker closes an Agent Browser session and records browser usage", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-close-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_close" };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_close", "usr_agent_browser_close")
+  });
+
+  const state = await withMockLiveAgentBrowser(async (browserState) => {
+    const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_close", env, {
+      method: "DELETE",
+      headers: { authorization: "Bearer agent-browser-close-token" }
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal((result.body.session as Record<string, unknown>).status, "completed");
+    assert.equal(env.DB.runs.some((run) => run.sql.includes("UPDATE jobs SET status = 'completed'")), true);
+    assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO usage_events") && run.values.includes("browser-minute")), true);
+    return browserState;
+  });
+
+  assert.deepEqual(state.connectedSessionIds, ["cf_browser_session_123"]);
+  assert.equal(state.closed, 1);
+});
+
+test("hosted worker hides Agent Browser provider session ids from job reads", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-public-job-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_public_job" };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ?",
+    row: browserSessionJobRow("job_agent_browser_public", "usr_agent_browser_public_job", {
+      handoffTokenHash: sha256("browser-session-handoff:vbha_hidden"),
+      handoffTokenExpiresAt: addDaysForTest(1)
+    })
+  });
+
+  const result = await fetchWorker("https://tools.vibecodr.space/v1/jobs/job_agent_browser_public", env, {
+    headers: { authorization: "Bearer agent-browser-public-job-token" }
+  });
+
+  assert.equal(result.response.status, 200);
+  const bodyText = JSON.stringify(result.body);
+  assert.equal(bodyText.includes("cf_browser_session_123"), false);
+  assert.equal(bodyText.includes("handoffTokenHash"), false);
+  assert.equal(bodyText.includes("vbha_hidden"), false);
+  assert.equal((result.body.result as Record<string, unknown>).sessionId, "job_agent_browser_public");
+  assert.equal((result.body.result as Record<string, unknown>).providerSessionId, undefined);
+});
+
+test("hosted worker creates a human auth handoff for an Agent Browser session", async () => {
+  const env = {
+    ...fakeLiveEnv("agent-browser-auth-token"),
+    VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_auth",
+    VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL: "https://vibecodr.space",
+    VC_TOOLS_BROWSER_RUN_ACCOUNT_ID: "acct_live_view",
+    VC_TOOLS_BROWSER_RUN_API_TOKEN: "cf_live_view_token"
+  };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_auth", "usr_agent_browser_auth")
+  });
+
+  const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_auth/auth", env, {
+    method: "POST",
+    headers: { authorization: "Bearer agent-browser-auth-token" }
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.equal((result.body.auth as Record<string, unknown>).status, "human_control");
+  assert.match(String((result.body.auth as Record<string, unknown>).handoffUrl), /^https:\/\/vibecodr\.space\/agent-browser\/live\/job_agent_browser_auth#token=vbha_/);
+  const bodyText = JSON.stringify(result.body);
+  assert.equal(bodyText.includes("cf_browser_session_123"), false);
+  assert.equal(bodyText.includes("cf_live_view_token"), false);
+  const stateWrite = env.DB.runs.find((run) => run.sql.includes("UPDATE jobs SET result_json"));
+  const storedState = JSON.parse(String(stateWrite?.values[0] ?? "{}")) as Record<string, unknown>;
+  assert.equal(storedState.providerSessionId, "cf_browser_session_123");
+  assert.equal(storedState.authState, "human_control");
+  assert.equal(typeof storedState.handoffTokenHash, "string");
+  assert.equal(String(storedState.handoffTokenHash).startsWith("vbha_"), false);
+  assert.equal(JSON.stringify(storedState).includes(String((result.body.auth as Record<string, unknown>).handoffUrl)), false);
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO audit_events") && run.values.includes("tools.browser_session.auth_requested")), true);
+});
+
+test("hosted worker creates a live Agent Browser watch link without pausing the agent", async () => {
+  const env = {
+    ...fakeLiveEnv("agent-browser-live-token"),
+    VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_live",
+    VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL: "https://vibecodr.space",
+    VC_TOOLS_BROWSER_RUN_ACCOUNT_ID: "acct_live_view",
+    VC_TOOLS_BROWSER_RUN_API_TOKEN: "cf_live_view_token"
+  };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_live", "usr_agent_browser_live")
+  });
+
+  const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_live/live", env, {
+    method: "POST",
+    headers: { authorization: "Bearer agent-browser-live-token" }
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.equal((result.body.auth as Record<string, unknown>).status, "public");
+  assert.equal((result.body.auth as Record<string, unknown>).controlMode, "watch");
+  assert.match(String((result.body.auth as Record<string, unknown>).handoffUrl), /^https:\/\/vibecodr\.space\/agent-browser\/live\/job_agent_browser_live#token=vbha_/);
+  const stateWrite = env.DB.runs.find((run) => run.sql.includes("UPDATE jobs SET result_json"));
+  const storedState = JSON.parse(String(stateWrite?.values[0] ?? "{}")) as Record<string, unknown>;
+  assert.equal(storedState.authState, undefined);
+  assert.equal(typeof storedState.handoffTokenHash, "string");
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO audit_events") && run.values.includes("tools.browser_session.live_requested")), true);
+});
+
+test("hosted worker exposes Agent Browser inspector view only when requested", async () => {
+  const token = `vbha_${"b".repeat(43)}`;
+  const env = {
+    ...fakeLiveEnv("agent-browser-devtools-token"),
+    VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_devtools",
+    VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL: "https://vibecodr.space",
+    VC_TOOLS_BROWSER_RUN_ACCOUNT_ID: "acct_live_view",
+    VC_TOOLS_BROWSER_RUN_API_TOKEN: "cf_live_view_token"
+  };
+  const handoffState = {
+    authState: "public",
+    handoffRequestedAt: new Date().toISOString(),
+    handoffUpdatedAt: new Date().toISOString(),
+    handoffTokenHash: sha256(`browser-session-handoff:${token}`),
+    handoffTokenExpiresAt: addDaysForTest(1)
+  };
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_devtools", "usr_agent_browser_devtools")
+  });
+  const live = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_devtools/live?view=devtools", env, {
+    method: "POST",
+    headers: { authorization: "Bearer agent-browser-devtools-token" }
+  });
+
+  assert.equal(live.response.status, 200);
+  assert.match(String((live.body.auth as Record<string, unknown>).handoffUrl), /^https:\/\/vibecodr\.space\/agent-browser\/live\/job_agent_browser_devtools#token=vbha_[A-Za-z0-9_-]+&view=devtools$/);
+  assert.equal((live.body.auth as Record<string, unknown>).viewMode, "devtools");
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_devtools", "usr_agent_browser_devtools", handoffState)
+  });
+  const jsonPage = await withMockLiveViewTarget(() => fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_devtools?view=devtools", env, {
+    headers: {
+      accept: "application/json",
+      origin: "https://vibecodr.space",
+      [HANDOFF_TOKEN_HEADER]: token
+    }
+  }));
+
+  assert.equal(jsonPage.response.status, 200);
+  assert.equal((jsonPage.body.liveView as Record<string, unknown>).viewMode, "devtools");
+  assert.equal((jsonPage.body.liveView as Record<string, unknown>).liveViewUrl, "https://live.browser.run/ui/view?wss=live.browser.run%2Fapi%2Fdevtools%2Fbrowser%2Fcf_browser_session_123%2Fpage%2Ftarget_123%3Fjwt%3Dabc&mode=devtools");
+  assert.equal(JSON.stringify(jsonPage.body).includes(token), false);
+});
+
+test("hosted worker serves a token-gated handoff page and completes the handoff", async () => {
+  const token = `vbha_${"a".repeat(43)}`;
+  const env = {
+    ...fakeLiveEnv("agent-browser-handoff-token"),
+    VC_TOOLS_BROWSER_RUN_ACCOUNT_ID: "acct_live_view",
+    VC_TOOLS_BROWSER_RUN_API_TOKEN: "cf_live_view_token"
+  };
+  const handoffState = {
+    authState: "human_control",
+    handoffRequestedAt: new Date().toISOString(),
+    handoffUpdatedAt: new Date().toISOString(),
+    handoffTokenHash: sha256(`browser-session-handoff:${token}`),
+    handoffTokenExpiresAt: addDaysForTest(1)
+  };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", handoffState)
+  });
+
+  const page = await withMockLiveViewTarget(() => fetchWorkerText(`https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff?token=${token}`, env));
+
+  assert.equal(page.response.status, 200);
+  assert.match(page.text, /Open live browser/);
+  assert.match(page.text, /https:\/\/live\.browser\.run\/ui\/view/);
+  assert.match(page.text, /Take control/);
+  assert.match(page.text, /Give control back to agent/);
+  assert.match(page.text, /End browser/);
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", handoffState)
+  });
+  const preflight = await fetchWorkerText("https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff", env, {
+    method: "OPTIONS",
+    headers: {
+      origin: "https://vibecodr.space",
+      "access-control-request-headers": HANDOFF_TOKEN_HEADER
+    }
+  });
+  assert.equal(preflight.response.status, 204);
+  assert.match(preflight.response.headers.get("access-control-allow-headers") ?? "", /x-vibecodr-handoff-token/);
+
+  const jsonPage = await withMockLiveViewTarget(() => fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff", env, {
+    headers: {
+      accept: "application/json",
+      origin: "https://vibecodr.space",
+      [HANDOFF_TOKEN_HEADER]: token
+    }
+  }));
+
+  assert.equal(jsonPage.response.status, 200);
+  assert.equal((jsonPage.body.liveView as Record<string, unknown>).liveViewUrl, "https://live.browser.run/ui/view?wss=live.browser.run%2Fapi%2Fdevtools%2Fbrowser%2Fcf_browser_session_123%2Fpage%2Ftarget_123%3Fjwt%3Dabc&mode=tab");
+  assert.equal((jsonPage.body.liveView as Record<string, unknown>).viewMode, "tab");
+  assert.equal((jsonPage.body.auth as Record<string, unknown>).status, "human_control");
+  assert.equal(JSON.stringify(jsonPage.body).includes(token), false);
+  assert.equal(jsonPage.response.headers.get("access-control-allow-origin"), "https://vibecodr.space");
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", handoffState)
+  });
+  const complete = await withMockLiveViewTarget(() => fetchWorkerText(`https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff/complete?token=${token}`, env, {
+    method: "POST"
+  }));
+
+  assert.equal(complete.response.status, 200);
+  assert.match(complete.text, /Control returned/);
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", {
+      ...handoffState,
+      authState: "public"
+    })
+  });
+  const takeControl = await withMockLiveViewTarget(() => fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff/take-control", env, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      origin: "https://vibecodr.space",
+      [HANDOFF_TOKEN_HEADER]: token
+    }
+  }));
+
+  assert.equal(takeControl.response.status, 200);
+  assert.equal(takeControl.body.action, "take-control");
+  assert.equal((takeControl.body.auth as Record<string, unknown>).status, "human_control");
+  assert.equal((takeControl.body.liveView as Record<string, unknown>).liveViewUrl, "https://live.browser.run/ui/view?wss=live.browser.run%2Fapi%2Fdevtools%2Fbrowser%2Fcf_browser_session_123%2Fpage%2Ftarget_123%3Fjwt%3Dabc&mode=tab");
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", handoffState)
+  });
+  const jsonComplete = await withMockLiveViewTarget(() => fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff/complete", env, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      origin: "https://vibecodr.space",
+      [HANDOFF_TOKEN_HEADER]: token
+    }
+  }));
+
+  assert.equal(jsonComplete.response.status, 200);
+  assert.equal(jsonComplete.body.action, "complete");
+  assert.equal((jsonComplete.body.auth as Record<string, unknown>).status, "auth_ready");
+  assert.equal(JSON.stringify(jsonComplete.body).includes(token), false);
+  const stateWrite = env.DB.runs.findLast((run) => run.sql.includes("UPDATE jobs SET result_json"));
+  const storedState = JSON.parse(String(stateWrite?.values[0] ?? "{}")) as Record<string, unknown>;
+  assert.equal(storedState.authState, "auth_ready");
+  assert.equal(typeof storedState.handoffTokenHash, "string");
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO audit_events") && run.values.includes("tools.browser_session.auth_completed")), true);
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_handoff", "usr_agent_browser_handoff", {
+      ...handoffState,
+      authState: "public"
+    })
+  });
+  const browserState = await withMockLiveAgentBrowser(async (state) => {
+    const close = await fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_handoff/close", env, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        origin: "https://vibecodr.space",
+        [HANDOFF_TOKEN_HEADER]: token
+      }
+    });
+
+    assert.equal(close.response.status, 200);
+    assert.equal(close.body.action, "close");
+    assert.equal(close.body.status, "closed");
+    assert.equal((close.body.session as Record<string, unknown>).status, "completed");
+    assert.equal(JSON.stringify(close.body).includes(token), false);
+    return state;
+  });
+  assert.deepEqual(browserState.connectedSessionIds, ["cf_browser_session_123"]);
+  assert.equal(browserState.closed, 1);
+  assert.equal(env.DB.runs.some((run) => run.sql.includes("INSERT INTO audit_events") && run.values.includes("tools.browser_session.closed")), true);
+});
+
+test("hosted worker redacts credential-bearing handoff target URLs", async () => {
+  const token = `vbha_${"c".repeat(43)}`;
+  const env = {
+    ...fakeLiveEnv("agent-browser-sensitive-handoff-token"),
+    VC_TOOLS_BROWSER_RUN_ACCOUNT_ID: "acct_live_view",
+    VC_TOOLS_BROWSER_RUN_API_TOKEN: "cf_live_view_token"
+  };
+  const handoffState = {
+    authState: "human_control",
+    handoffRequestedAt: new Date().toISOString(),
+    handoffUpdatedAt: new Date().toISOString(),
+    handoffTokenHash: sha256(`browser-session-handoff:${token}`),
+    handoffTokenExpiresAt: addDaysForTest(1)
+  };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_sensitive_handoff", "usr_agent_browser_sensitive_handoff", {
+      ...handoffState,
+      currentUrl: "https://stored-user:stored-pass@example.com/callback?token=stored-secret#access_token=stored-fragment"
+    })
+  });
+
+  const sensitiveTargetUrl = "https://target-user:target-pass@example.com/callback?code=oauth-secret&ok=1#access_token=fragment-secret";
+  const page = await withMockLiveViewTarget(
+    () => fetchWorkerText(`https://tools.vibecodr.space/browser/handoff/job_agent_browser_sensitive_handoff?token=${token}`, env),
+    { url: sensitiveTargetUrl, title: "Bearer title-secret" }
+  );
+
+  assert.equal(page.response.status, 200);
+  assert.match(page.text, /https:\/\/example\.com\/callback\?code=%5Bredacted%5D&amp;ok=1/);
+  assert.match(page.text, /Bearer \[redacted\]/);
+  assert.doesNotMatch(page.text, /oauth-secret|fragment-secret|target-user|target-pass|title-secret|stored-secret|stored-fragment|stored-user|stored-pass/);
+
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_sensitive_handoff", "usr_agent_browser_sensitive_handoff", {
+      ...handoffState,
+      currentUrl: "https://stored-user:stored-pass@example.com/callback?token=stored-secret#access_token=stored-fragment"
+    })
+  });
+  const jsonPage = await withMockLiveViewTarget(
+    () => fetchWorker("https://tools.vibecodr.space/browser/handoff/job_agent_browser_sensitive_handoff", env, {
+      headers: {
+        accept: "application/json",
+        origin: "https://vibecodr.space",
+        [HANDOFF_TOKEN_HEADER]: token
+      }
+    }),
+    { url: sensitiveTargetUrl, title: "Bearer title-secret" }
+  );
+
+  const liveView = jsonPage.body.liveView as Record<string, unknown>;
+  const session = jsonPage.body.session as Record<string, unknown>;
+  assert.equal(liveView.targetUrl, "https://example.com/callback?code=%5Bredacted%5D&ok=1");
+  assert.equal(liveView.targetTitle, "Bearer [redacted]");
+  assert.equal(session.url, "https://example.com/callback?token=%5Bredacted%5D");
+  assert.equal(JSON.stringify(jsonPage.body).includes(token), false);
+  assert.equal(JSON.stringify(jsonPage.body).includes("oauth-secret"), false);
+  assert.equal(JSON.stringify(jsonPage.body).includes("stored-secret"), false);
+  assert.equal(JSON.stringify(jsonPage.body).includes("target-user"), false);
+  assert.equal(JSON.stringify(jsonPage.body).includes("stored-user"), false);
+});
+
+test("hosted worker pauses Agent Browser controls while human auth handoff is active", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-human-control-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_human_control" };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_human_control", "usr_agent_browser_human_control", {
+      authState: "human_control",
+      handoffTokenHash: sha256("browser-session-handoff:vbha_active"),
+      handoffTokenExpiresAt: addDaysForTest(1)
+    })
+  });
+
+  const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_human_control", env, {
+    headers: { authorization: "Bearer agent-browser-human-control-token" }
+  });
+
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.code, "browser_session.human_control");
+});
+
+test("hosted worker blocks Agent Browser controls after auth revoke", async () => {
+  const env = { ...fakeLiveEnv("agent-browser-auth-revoked-token"), VC_TOOLS_STATIC_TOKEN_ACTOR_ID: "usr_agent_browser_auth_revoked" };
+  env.DB.firstRowsByQuery.push({
+    sqlIncludes: "FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'",
+    row: browserSessionJobRow("job_agent_browser_auth_revoked", "usr_agent_browser_auth_revoked", {
+      authState: "revoked",
+      handoffRevokedAt: new Date().toISOString()
+    })
+  });
+
+  const result = await fetchWorker("https://tools.vibecodr.space/v1/browser/sessions/job_agent_browser_auth_revoked/actions", env, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer agent-browser-auth-revoked-token",
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({
+      action: "click",
+      selector: "button.start"
+    })
+  });
+
+  assert.equal(result.response.status, 409);
+  assert.equal(result.body.code, "browser_session.auth_revoked");
 });
 
 test("hosted queue handler rejects Browser Agent execution because Workflows own that lane", async () => {
@@ -3688,6 +4243,51 @@ function addDaysForTest(days: number): string {
   return date.toISOString();
 }
 
+function browserSessionJobRow(id: string, actorId: string, stateOverrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const createdAt = new Date().toISOString();
+  return {
+    id,
+    actor_id: actorId,
+    plan_name: "Creator",
+    capability: "browser.session_open",
+    status: "running",
+    input_json: JSON.stringify({
+      kind: "browser-session",
+      url: "https://example.com/",
+      timeoutMs: 1_200_000,
+      idleTimeoutMs: 600_000
+    }),
+    result_json: JSON.stringify({
+      sessionId: id,
+      providerSessionId: "cf_browser_session_123",
+      requestedUrl: "https://example.com/",
+      currentUrl: "https://example.com/",
+      title: "Example",
+      status: "running",
+      createdAt,
+      updatedAt: createdAt,
+      expiresAt: addDaysForTest(1),
+      timeoutMs: 1_200_000,
+      idleTimeoutMs: 600_000,
+      actionCount: 0,
+      observationCount: 1,
+      lastArtifactId: "art_previous",
+      ...stateOverrides
+    }),
+    error_code: null,
+    error_message: null,
+    provider_mode: "live",
+    queue_global_ahead: 0,
+    queue_actor_ahead: 0,
+    queue_delay_seconds: 0,
+    created_at: createdAt,
+    updated_at: createdAt,
+    started_at: createdAt,
+    completed_at: null,
+    canceled_at: null
+  };
+}
+
 async function withPublicDns<T>(callback: () => Promise<T>): Promise<T> {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (input, init) => {
@@ -3699,6 +4299,40 @@ async function withPublicDns<T>(callback: () => Promise<T>): Promise<T> {
     }
     if (init?.method === "HEAD") {
       return new Response(null, { status: 204 });
+    }
+    return originalFetch(input, init);
+  };
+  try {
+    return await callback();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+async function withMockLiveViewTarget<T>(
+  callback: () => Promise<T>,
+  targetOverrides: Partial<{ url: string; title: string; devtoolsFrontendUrl: string }> = {}
+): Promise<T> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes("/browser-rendering/devtools/browser/cf_browser_session_123/json/list")) {
+      const headers = new Headers(init?.headers);
+      assert.equal(headers.get("authorization"), "Bearer cf_live_view_token");
+      return new Response(JSON.stringify([
+        {
+          id: "target_123",
+          type: "page",
+          url: targetOverrides.url ?? "https://example.com/account",
+          title: targetOverrides.title ?? "Example Account",
+          devtoolsFrontendUrl:
+            targetOverrides.devtoolsFrontendUrl ??
+            "https://live.browser.run/ui/inspector?wss=live.browser.run/api/devtools/browser/cf_browser_session_123/page/target_123?jwt=abc&mode=devtools",
+          webSocketDebuggerUrl: "wss://live.browser.run/api/devtools/browser/cf_browser_session_123/page/target_123?jwt=abc"
+        }
+      ]), {
+        headers: { "content-type": "application/json" }
+      });
     }
     return originalFetch(input, init);
   };
@@ -3776,6 +4410,100 @@ async function withMockBrowserSession<T>(
     return await callback(state);
   } finally {
     puppeteerMock.launch = originalLaunch;
+  }
+}
+
+async function withMockLiveAgentBrowser<T>(
+  callback: (state: {
+    closed: number;
+    disconnected: number;
+    connectedSessionIds: string[];
+    launchOptions: Array<Record<string, unknown> | undefined>;
+    navigations: string[];
+    clicks: string[];
+    typed: string[];
+    scrolls: number[];
+  }) => Promise<T>
+): Promise<T> {
+  const state = {
+    closed: 0,
+    disconnected: 0,
+    connectedSessionIds: [] as string[],
+    launchOptions: [] as Array<Record<string, unknown> | undefined>,
+    navigations: [] as string[],
+    clicks: [] as string[],
+    typed: [] as string[],
+    scrolls: [] as number[]
+  };
+  let currentUrl = "https://example.com/";
+  const page = {
+    setDefaultNavigationTimeout(_ms: number) {},
+    async setRequestInterception(_enabled: boolean) {},
+    on(_event: string, _handler: unknown) {},
+    async goto(url: string) {
+      currentUrl = url;
+      state.navigations.push(url);
+    },
+    url() {
+      return currentUrl;
+    },
+    async click(selector: string) {
+      state.clicks.push(selector);
+    },
+    async type(selector: string, text: string) {
+      state.typed.push(`${selector}:${text}`);
+    },
+    async screenshot() {
+      return new Uint8Array([1, 2, 3, 4]);
+    },
+    async evaluate(_fn: unknown, arg?: unknown) {
+      if (typeof arg === "number") {
+        state.scrolls.push(arg);
+      }
+      return {
+        title: "Example",
+        finalUrl: currentUrl,
+        text: "Example page text",
+        links: [{ text: "Docs", href: "https://example.com/docs" }]
+      };
+    }
+  };
+  const browser = {
+    sessionId() {
+      return "cf_browser_session_123";
+    },
+    async newPage() {
+      return page;
+    },
+    async pages() {
+      return [page];
+    },
+    async disconnect() {
+      state.disconnected += 1;
+    },
+    async close() {
+      state.closed += 1;
+    }
+  };
+  const puppeteerMock = puppeteer as unknown as {
+    launch: (binding: unknown, options?: Record<string, unknown>) => Promise<typeof browser>;
+    connect?: (binding: unknown, sessionId: string) => Promise<typeof browser>;
+  };
+  const originalLaunch = puppeteerMock.launch;
+  const originalConnect = puppeteerMock.connect;
+  puppeteerMock.launch = async (_binding, options) => {
+    state.launchOptions.push(options);
+    return browser;
+  };
+  puppeteerMock.connect = async (_binding, sessionId) => {
+    state.connectedSessionIds.push(sessionId);
+    return browser;
+  };
+  try {
+    return await callback(state);
+  } finally {
+    puppeteerMock.launch = originalLaunch;
+    puppeteerMock.connect = originalConnect;
   }
 }
 

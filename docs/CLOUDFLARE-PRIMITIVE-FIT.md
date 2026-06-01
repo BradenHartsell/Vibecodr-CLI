@@ -1,6 +1,6 @@
 # Cloudflare Primitive Fit
 
-Last checked against Cloudflare docs: 2026-05-17.
+Last checked against Cloudflare docs: 2026-05-31.
 
 This document records which current Cloudflare primitives belong in
 `vc-tools`, and which ones are intentionally deferred. The goal is to avoid
@@ -46,11 +46,47 @@ split by workflow shape:
   because the hosted service can submit a bounded request, meter browser time,
   store an artifact, and avoid local browser execution.
 - Browser Sessions support direct browser control and session reuse. They carry
-  separate concurrency/pricing pressure and belong only inside the paid
-  `browser.agent_task` lane, not the stateless Quick Actions lane.
+  separate concurrency/pricing pressure and belong in paid Agent Browser lanes:
+  durable `browser.agent_task` Workflows for one-shot bounded tasks, and explicit
+  `browser.session.*` open/observe/action/close controls when the agent needs to
+  watch and steer a live hosted browser over multiple turns.
 - `/crawl` is a Browser Run Quick Action, not a Dynamic Workers feature. It
   starts an async provider crawl job and returns site records as a hosted
   artifact under `vc-tools` quota, retention, and audit.
+
+Browser Run Live View and Human in the Loop are the correct primitives for the
+user-visible Agent Browser product:
+
+- Live View is available for active Browser Sessions created through CDP,
+  Puppeteer, or Playwright, and the `devtoolsFrontendUrl` streams the actual
+  remote browser tab through `https://live.browser.run`.
+- Live View has two hosted modes: `mode=tab` for the standalone page view and
+  `mode=devtools` for inspector-style DevTools. Vibecodr's user route should
+  embed the tab view as the primary browser surface; inspector/devtools links
+  are an advanced fallback.
+- `devtoolsFrontendUrl` values are short-lived minting artifacts, valid for
+  about five minutes before opening. The hosted Worker should refresh targets
+  server-side and return fresh token-gated live-view URLs to the Vibecodr app.
+- Human in the Loop is not a separate browser product. It is a control state on
+  the same live Browser Session: the agent keeps the hosted browser open,
+  shares the live view, the human acts in that browser, then the agent resumes
+  after navigation, DOM state, or explicit completion indicates the handoff is
+  done.
+- Session recording is opt-in per Browser Session, finalized only after the
+  session closes, retained for 30 days, and not available for Quick Actions. It
+  records rrweb DOM/events, not pixels; input values are masked and canvas,
+  cross-origin iframes, video/audio, and WebGL have replay limitations.
+- Reused sessions help performance, but Browser Sessions still need explicit
+  lifecycle ownership. Use `browser.disconnect()` only when another worker or
+  request is intentionally allowed to reconnect; otherwise close explicitly and
+  meter usage. The Vibecodr owner live page should expose that as an ordinary
+  "End browser" action, not as provider lifecycle jargon.
+- WebMCP is promising but lab-only/experimental. It belongs behind an opt-in
+  capability for sites that expose structured browser tools, not in the default
+  production Agent Browser path.
+- Stagehand can sit above Browser Run for more resilient page actions, but the
+  current Cloudflare guide supports `@browserbasehq/stagehand` `v2.5.x` only.
+  Treat it as a future action-planning layer, not the Browser Session authority.
 
 Cloudflare Workflows are the right durable primitive for long paid browser
 tasks:
@@ -108,6 +144,8 @@ Cloudflare Sandbox SDK is different:
 | --- | --- | --- |
 | Screenshot, PDF, markdown, rendered page inspection, bounded crawl | Browser Run Quick Actions | Stateless, Cloudflare-hosted, no Worker code loading required |
 | Paid browser agent task up to 20 minutes on Creator or 1 hour on Pro | Cloudflare Workflow plus Browser Run Session | Workflow owns durable job execution/retry; Browser Session provides browser-native control with explicit close/finally behavior, 10-minute idle closure, and saved JSON artifacts |
+| Multi-turn live Agent Browser interaction | Browser Run Session plus D1/R2 session state | The hosted Worker keeps the provider session id behind a Vibecodr job id, reconnects for observe/action commands, saves screenshot proof to R2, and closes/meters usage explicitly |
+| Live watch/takeover inside Agent Browser | Browser Run Live View plus the Vibecodr `/agent-browser/live/:sessionId` route | The hosted Worker mints a short-lived Vibecodr URL, stores only a token hash, refreshes Cloudflare Live View target URLs server-side, embeds the actual remote browser tab through the main app route, pauses agent observe/action only during human control, and can resume, end the live link, or close the browser explicitly |
 | Shell command or test execution | Sandbox SDK | Real isolated container/process/filesystem boundary; Creator uses `standard-1`, Pro uses `standard-2` |
 | Agent-authored JavaScript tool code | Dynamic Workers `load(code)` | Runtime-loaded Worker module with controlled bindings and egress |
 | Reused user-defined HTTP tool/app code | Dynamic Workers `get(id, callback)` | Stable ID can keep the Worker warm and avoid reloading every call |
@@ -143,7 +181,10 @@ Cloudflare Sandbox SDK is different:
 - Browser access should be liberal for public HTTPS targets and strict at trust
   boundaries. Browser Run must not cross into private networks, authenticated
   user accounts, Vibecodr infrastructure, or provider secrets without an
-  explicit future grant.
+  explicit human handoff or future scoped grant. Human handoff is still not a
+  raw-cookie lane: no API, MCP, CLI, artifact, or job output should accept or
+  serialize cookies, passwords, custom auth headers, storage state, Cloudflare
+  API tokens, or provider session ids.
 
 ## Adoption Gate
 
@@ -206,6 +247,20 @@ The best production architecture is:
   https://developers.cloudflare.com/dynamic-workers/usage/dynamic-workflows/
 - Cloudflare Browser Run:
   https://developers.cloudflare.com/browser-run/
+- Cloudflare Browser Run Live View:
+  https://developers.cloudflare.com/browser-run/features/live-view/
+- Cloudflare Browser Run Human in the Loop:
+  https://developers.cloudflare.com/browser-run/features/human-in-the-loop/
+- Cloudflare Browser Run Session recording:
+  https://developers.cloudflare.com/browser-run/features/session-recording/
+- Cloudflare Browser Run WebMCP:
+  https://developers.cloudflare.com/browser-run/features/webmcp/
+- Cloudflare Browser Run Reuse sessions:
+  https://developers.cloudflare.com/browser-run/features/reuse-sessions/
+- Cloudflare Browser Run MCP clients:
+  https://developers.cloudflare.com/browser-run/cdp/mcp-clients/
+- Cloudflare Browser Run Stagehand:
+  https://developers.cloudflare.com/browser-run/stagehand/
 - Cloudflare Sandbox SDK architecture:
   https://developers.cloudflare.com/sandbox/concepts/architecture/
 - Cloudflare Sandbox SDK Wrangler configuration:

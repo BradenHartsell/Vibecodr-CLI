@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { Readable, Writable } from "node:stream";
@@ -48,6 +49,7 @@ const ARTIFACT_OUTPUT_WORKSPACE_MESSAGE =
   "Artifact output is workspace-bounded so downloaded bytes can only be written to files you intentionally target inside this workspace. Use --local for ./vibecodr-proof, --out ./artifacts, --out ./artifacts/report.pdf, or cd to the intended workspace and use --out .";
 const ARTIFACT_INPUT_WORKSPACE_MESSAGE =
   "Artifact upload sources are workspace-bounded so the CLI only reads files you intentionally target inside this workspace. Move the file into this workspace, or cd to the workspace that contains it.";
+const WORKSPACE_SCRATCH_PROOF_DIR = ".vibecodr/browser-artifacts";
 
 export interface RunCliOptions {
   env?: NodeJS.ProcessEnv;
@@ -316,11 +318,19 @@ async function commandTry(context: CommandContext, parsed: ParsedCommandOptions)
   const { profile } = await context.store.getProfile(context.globals.profile);
   const client = createClient(context, profile, await resolveToken(context, true));
   const proofDir = getStringFlag(parsed.flags, "out") ?? "vibecodr-proof";
+  const proofOutput = await prepareAutoProofOutput(context, {
+    positionals: [],
+    flags: {
+      ...parsed.flags,
+      out: proofDir
+    }
+  });
+  const resolvedProofDir = getStringFlag(proofOutput.parsed.flags, "out") ?? proofDir;
   const browserParsed: ParsedCommandOptions = {
     positionals: ["https://example.com"],
     flags: {
       ...parsed.flags,
-      out: proofDir,
+      out: resolvedProofDir,
       filename: "browser-read.md",
       pollIntervalMs: getStringFlag(parsed.flags, "pollIntervalMs") ?? "250"
     }
@@ -330,7 +340,7 @@ async function commandTry(context: CommandContext, parsed: ParsedCommandOptions)
     flags: {
       ...parsed.flags,
       command: "node -e \"console.log('vibecodr computer ok')\"",
-      out: proofDir,
+      out: resolvedProofDir,
       filename: "computer-run.json",
       pollIntervalMs: getStringFlag(parsed.flags, "pollIntervalMs") ?? "250"
     }
@@ -343,7 +353,7 @@ async function commandTry(context: CommandContext, parsed: ParsedCommandOptions)
     proof: "failed",
     usage: "failed"
   };
-  const warnings: string[] = [];
+  const warnings: string[] = [...proofOutput.warnings];
 
   const browserPayload = buildToolTestPayload("browser.extract_markdown", browserParsed.positionals[0], browserParsed);
   const browserWork = await client.request<unknown>("POST", "tools/test", { body: browserPayload });
@@ -381,12 +391,12 @@ async function commandTry(context: CommandContext, parsed: ParsedCommandOptions)
   const ready = Object.values(checks).every((status) => status === "ok");
   return {
     message: ready
-      ? `Vibecodr Agent Computer check passed.\nProof saved: ${path.resolve(context.cwd, proofDir)}`
-      : `Vibecodr Agent Computer check finished with attention needed.\nProof path: ${path.resolve(context.cwd, proofDir)}`,
+      ? `Vibecodr Agent Computer check passed.\nProof saved: ${path.resolve(context.cwd, resolvedProofDir)}`
+      : `Vibecodr Agent Computer check finished with attention needed.\nProof path: ${path.resolve(context.cwd, resolvedProofDir)}`,
     data: {
       ready,
       checks,
-      proofPath: path.resolve(context.cwd, proofDir)
+      proofPath: path.resolve(context.cwd, resolvedProofDir)
     },
     warnings,
     humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
@@ -844,8 +854,142 @@ async function commandBrowser(context: CommandContext, subcommand: string | unde
       const normalized = normalizeBrowserNotesOptions(parsed);
       return submitHostedCapability(context, "browser.notes", normalized, "Captured a hosted Browser snapshot with your note attached.", { autoFollow: true });
     }
+    case "session":
+      return commandBrowserSession(context, rest[0], rest.slice(1));
     default:
-      throw unknownSubcommandError("browser", subcommand, ["render", "screenshot", "read", "markdown", "pdf", "crawl", "snapshot", "notes"], "Use vibecodr browser screenshot <https-url>, browser read <https-url>, or browser snapshot <https-url> --local.");
+      throw unknownSubcommandError("browser", subcommand, ["render", "screenshot", "read", "markdown", "pdf", "crawl", "snapshot", "notes", "session"], "Use vibecodr browser screenshot <https-url>, browser read <https-url>, browser snapshot <https-url> --local, or browser session open <https-url>.");
+  }
+}
+
+async function commandBrowserSession(context: CommandContext, subcommand: string | undefined, rest: string[]): Promise<CommandResult> {
+  const parsed = parseCommandOptions(rest);
+  const { profile } = await context.store.getProfile(context.globals.profile);
+  const client = createClient(context, profile, await resolveToken(context, true));
+
+  switch (subcommand) {
+    case "open": {
+      const target = parsed.positionals[0];
+      if (!target) {
+        throw new CliError("input.url_required", "browser session open requires an HTTPS URL target.", 2);
+      }
+      const body: Record<string, unknown> = { url: validateBrowserUrl(target) };
+      const timeoutMs = validatePositiveInt(getStringFlag(parsed.flags, "timeoutMs"), "--timeout-ms", 1000, 3_600_000);
+      const idleTimeoutMs = validatePositiveInt(getStringFlag(parsed.flags, "idleTimeoutMs"), "--idle-timeout-ms", 1000, 600_000);
+      if (timeoutMs !== undefined) body.timeoutMs = timeoutMs;
+      if (idleTimeoutMs !== undefined) body.idleTimeoutMs = idleTimeoutMs;
+      const response = await client.request<unknown>("POST", "browser/sessions", { body });
+      return {
+        message: browserSessionMessage(response, "Opened Agent Browser session."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "observe": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("GET", `browser/sessions/${encodePathSegment(sessionId)}`);
+      return {
+        message: browserSessionMessage(response, "Observed Agent Browser session."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "goto":
+    case "navigate":
+    case "click":
+    case "type":
+    case "scroll":
+    case "wait": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const body = browserSessionActionBody(subcommand, parsed);
+      const response = await client.request<unknown>("POST", `browser/sessions/${encodePathSegment(sessionId)}/actions`, { body });
+      return {
+        message: browserSessionMessage(response, `Ran Agent Browser ${subcommand}.`),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "auth":
+    case "auth-request": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("POST", `browser/sessions/${encodePathSegment(sessionId)}/auth${browserSessionLiveViewQuery(parsed, context.globals.debug)}`);
+      const handoffUrl = browserSessionHandoffUrlFromResponse(response);
+      const skipOpen =
+        getBooleanFlag(parsed.flags, "noOpen") ||
+        parsed.flags.open === false ||
+        context.globals.json ||
+        context.globals.quiet ||
+        context.globals.noInput;
+      let opened = false;
+      if (handoffUrl && !skipOpen) {
+        opened = await maybeOpenBrowser(context, parsed, handoffUrl);
+      }
+      return {
+        message: browserSessionMessage(response, opened ? "Opened Agent Browser for you to control." : "Agent Browser control link ready."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "live":
+    case "watch":
+    case "view": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("POST", `browser/sessions/${encodePathSegment(sessionId)}/live${browserSessionLiveViewQuery(parsed, context.globals.debug)}`);
+      const handoffUrl = browserSessionHandoffUrlFromResponse(response);
+      const skipOpen =
+        getBooleanFlag(parsed.flags, "noOpen") ||
+        parsed.flags.open === false ||
+        context.globals.json ||
+        context.globals.quiet ||
+        context.globals.noInput;
+      let opened = false;
+      if (handoffUrl && !skipOpen) {
+        opened = await maybeOpenBrowser(context, parsed, handoffUrl);
+      }
+      return {
+        message: browserSessionMessage(response, opened ? "Opened Agent Browser live view." : "Agent Browser live view ready."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "auth-status": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("GET", `browser/sessions/${encodePathSegment(sessionId)}/auth`);
+      return {
+        message: browserSessionMessage(response, "Read Agent Browser live-control status."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "auth-complete":
+    case "auth-done": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("POST", `browser/sessions/${encodePathSegment(sessionId)}/auth/complete`);
+      return {
+        message: browserSessionMessage(response, "Gave Agent Browser control back to the agent."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "auth-revoke": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("POST", `browser/sessions/${encodePathSegment(sessionId)}/auth/revoke`);
+      return {
+        message: browserSessionMessage(response, "Ended Agent Browser live link."),
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    case "close": {
+      const sessionId = validateBrowserSessionId(parsed.positionals[0]);
+      const response = await client.request<unknown>("DELETE", `browser/sessions/${encodePathSegment(sessionId)}`);
+      return {
+        message: "Closed Agent Browser session.",
+        data: response,
+        humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
+      };
+    }
+    default:
+      throw unknownSubcommandError("browser session", subcommand, ["open", "observe", "goto", "click", "type", "scroll", "wait", "live", "auth", "auth-status", "auth-complete", "auth-revoke", "close"], "Use vibecodr browser session open <https-url>, live <sessionId>, observe <sessionId>, click <sessionId> --selector <css>, or close <sessionId>.");
   }
 }
 
@@ -947,6 +1091,9 @@ async function submitHostedCapability(
     parsed,
     context.globals.timeoutMs === 30_000 ? undefined : context.globals.timeoutMs
   );
+  const proofOutput = options.autoFollow === true && !shouldSkipWait(parsed)
+    ? await prepareAutoProofOutput(context, parsed)
+    : { parsed, warnings: [] };
   const { profile } = await context.store.getProfile(context.globals.profile);
   const client = createClient(context, profile, await resolveToken(context, true));
   const response = await client.request<unknown>("POST", "tools/test", {
@@ -954,7 +1101,7 @@ async function submitHostedCapability(
   });
 
   if (options.autoFollow === true && !shouldSkipWait(parsed)) {
-    return followSubmittedWork(context, client, capability, response, parsed);
+    return followSubmittedWork(context, client, capability, response, proofOutput.parsed, proofOutput.warnings);
   }
 
   return {
@@ -972,13 +1119,15 @@ async function followSubmittedWork(
   client: ApiClient,
   capability: CapabilityName,
   submitted: unknown,
-  parsed: ParsedCommandOptions
+  parsed: ParsedCommandOptions,
+  warnings: string[] = []
 ): Promise<CommandResult> {
   const jobId = jobIdFromWork(submitted);
   if (!jobId) {
     return {
       message: completedCapabilityMessage(capability),
       data: publicWorkResult(capability, submitted, parsed),
+      warnings,
       humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
     };
   }
@@ -994,22 +1143,25 @@ async function followSubmittedWork(
   return {
     message: formatCompletedWorkMessage(capability, terminal, proof),
     data: publicWorkResult(capability, terminal, parsed, proof),
+    warnings,
     humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
   };
 }
 
 async function commandWorkFollow(context: CommandContext, parsed: ParsedCommandOptions): Promise<CommandResult> {
   const jobId = validateEntityId(requiredPositional(parsed, 0, "work follow requires a job id."), "job id");
+  const proofOutput = await prepareAutoProofOutput(context, parsed);
   const { profile } = await context.store.getProfile(context.globals.profile);
   const client = createClient(context, profile, await resolveToken(context, true));
-  const job = await pollWorkUntilTerminal(client, jobId, parsed);
+  const job = await pollWorkUntilTerminal(client, jobId, proofOutput.parsed);
   const artifactId = artifactIdFromWork(job);
-  const proof = artifactId && shouldSaveArtifact(parsed)
-    ? await saveArtifact(context, client, artifactId, parsedWithLocalOutput(parsed))
+  const proof = artifactId && shouldSaveArtifact(proofOutput.parsed)
+    ? await saveArtifact(context, client, artifactId, proofOutput.parsed)
     : undefined;
   return {
     message: formatCompletedWorkMessage(undefined, job, proof),
-    data: publicWorkResult(undefined, job, parsed, proof),
+    data: publicWorkResult(undefined, job, proofOutput.parsed, proof),
+    warnings: proofOutput.warnings,
     humanData: getBooleanFlag(parsed.flags, "details") ? "show" : "hide"
   };
 }
@@ -1119,6 +1271,71 @@ function parsedWithLocalOutput(parsed: ParsedCommandOptions): ParsedCommandOptio
       out: DEFAULT_LOCAL_PROOF_DIR
     }
   };
+}
+
+interface PreparedProofOutput {
+  parsed: ParsedCommandOptions;
+  warnings: string[];
+}
+
+async function prepareAutoProofOutput(context: CommandContext, parsed: ParsedCommandOptions): Promise<PreparedProofOutput> {
+  if (!shouldSaveArtifact(parsed)) {
+    return { parsed, warnings: [] };
+  }
+
+  const withLocalOutput = parsedWithLocalOutput(parsed);
+  const out = getStringFlag(withLocalOutput.flags, "out") ?? ".";
+  const outPath = path.resolve(context.cwd, out);
+
+  try {
+    await ensureOutputPathAllowed(context.cwd, outPath);
+    return { parsed: withLocalOutput, warnings: [] };
+  } catch (error) {
+    const cliError = toCliError(error);
+    if (cliError.code !== "file.outside_workspace" || !isPathOutside(path.resolve(context.cwd), outPath)) {
+      throw error;
+    }
+  }
+
+  const fallbackOut = await allocateScratchProofOutputDir(context.cwd);
+  return {
+    parsed: {
+      ...withLocalOutput,
+      flags: {
+        ...withLocalOutput.flags,
+        out: fallbackOut
+      }
+    },
+    warnings: [
+      `Output path is outside this workspace, so hosted artifacts cannot be written there. Writing to ${formatCliPath(fallbackOut)} instead. This scratch folder is gitignored; use --out ./path-inside-workspace to choose another workspace path.`
+    ]
+  };
+}
+
+async function allocateScratchProofOutputDir(cwd: string): Promise<string> {
+  const root = path.join(cwd, WORKSPACE_SCRATCH_PROOF_DIR);
+  await fs.mkdir(root, { recursive: true });
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const relative = `${WORKSPACE_SCRATCH_PROOF_DIR}/${timestamp}-${randomUUID().slice(0, 8)}`;
+    const absolute = path.resolve(cwd, relative);
+    try {
+      await fs.mkdir(absolute, { recursive: false });
+      return relative;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+
+  throw new CliError("file.scratch_output_failed", "Could not create a workspace scratch output directory for hosted artifacts.", 5);
+}
+
+function formatCliPath(input: string): string {
+  const normalized = input.split(path.sep).join("/");
+  return normalized.startsWith("./") || normalized.startsWith("../") ? normalized : `./${normalized}`;
 }
 
 function formatCompletedWorkMessage(capability: CapabilityName | undefined, work: unknown, proof?: SavedArtifact): string {
@@ -1279,6 +1496,129 @@ function normalizeBrowserNotesOptions(parsed: ParsedCommandOptions): ParsedComma
     positionals: url === undefined ? [] : [url],
     flags
   };
+}
+
+function validateBrowserSessionId(input: string | undefined): string {
+  return validateEntityId(input ?? "", "Agent Browser session id");
+}
+
+function browserSessionActionBody(subcommand: string, parsed: ParsedCommandOptions): Record<string, unknown> {
+  if (subcommand === "goto" || subcommand === "navigate") {
+    const target = getStringFlag(parsed.flags, "url") ?? parsed.positionals[1];
+    if (!target) {
+      throw new CliError("input.url_required", `browser session ${subcommand} requires an HTTPS URL target.`, 2);
+    }
+    return { action: "navigate", url: validateBrowserUrl(target) };
+  }
+  if (subcommand === "click") {
+    return { action: "click", selector: requiredBrowserSessionSelector(parsed, "browser session click requires --selector <css>.") };
+  }
+  if (subcommand === "type") {
+    const text = getStringFlag(parsed.flags, "text") ?? parsed.positionals.slice(2).join(" ").trim();
+    if (!text) {
+      throw new CliError("input.text_required", "browser session type requires --text <text>.", 2);
+    }
+    return {
+      action: "type",
+      selector: requiredBrowserSessionSelector(parsed, "browser session type requires --selector <css>."),
+      text: text.slice(0, 2_000)
+    };
+  }
+  if (subcommand === "scroll") {
+    const deltaY = validateIntegerRange(getStringFlag(parsed.flags, "deltaY") ?? parsed.positionals[1], "--delta-y", -10_000, 10_000);
+    return deltaY === undefined ? { action: "scroll" } : { action: "scroll", deltaY };
+  }
+  if (subcommand === "wait") {
+    const ms = validateIntegerRange(getStringFlag(parsed.flags, "ms") ?? parsed.positionals[1], "--ms", 1, 30_000);
+    return ms === undefined ? { action: "wait" } : { action: "wait", ms };
+  }
+  throw new CliError("input.invalid_browser_session_action", "Unknown Agent Browser session action.", 2);
+}
+
+function browserSessionLiveViewQuery(parsed: ParsedCommandOptions, globalDebug = false): string {
+  const mode = browserSessionLiveViewMode(parsed, globalDebug);
+  return mode === "devtools" ? "?view=devtools" : "";
+}
+
+function browserSessionLiveViewMode(parsed: ParsedCommandOptions, globalDebug = false): "tab" | "devtools" {
+  const raw = (getStringFlag(parsed.flags, "view") ?? getStringFlag(parsed.flags, "mode") ?? "").trim().toLowerCase();
+  const debug = globalDebug || getBooleanFlag(parsed.flags, "debug") || getBooleanFlag(parsed.flags, "devtools");
+  if (debug && (raw === "tab" || raw === "browser")) {
+    throw new CliError("input.invalid_live_view_mode", "Use either --debug/--devtools or --view tab, not both.", 2);
+  }
+  if (debug || raw === "devtools" || raw === "debug" || raw === "inspector") {
+    return "devtools";
+  }
+  if (!raw || raw === "tab" || raw === "browser") {
+    return "tab";
+  }
+  throw new CliError("input.invalid_live_view_mode", "Agent Browser live view mode must be tab or devtools.", 2);
+}
+
+function requiredBrowserSessionSelector(parsed: ParsedCommandOptions, message: string): string {
+  const selector = getStringFlag(parsed.flags, "selector") ?? parsed.positionals[1];
+  if (!selector || selector.trim().length === 0) {
+    throw new CliError("input.selector_required", message, 2);
+  }
+  return selector.trim().slice(0, 500);
+}
+
+function validateIntegerRange(input: string | undefined, label: string, min: number, max: number): number | undefined {
+  if (input === undefined) {
+    return undefined;
+  }
+  const value = Number(input);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new CliError("input.invalid_number", `${label} must be an integer from ${min} to ${max}.`, 2);
+  }
+  return value;
+}
+
+function browserSessionMessage(response: unknown, fallback: string): string {
+  if (!isRecord(response)) {
+    return fallback;
+  }
+  const session = isRecord(response.session) ? response.session : undefined;
+  const id = typeof session?.id === "string" ? session.id : typeof response.id === "string" ? response.id : undefined;
+  const observation = isRecord(response.observation) ? response.observation : undefined;
+  const screenshot = isRecord(observation?.screenshot) ? observation?.screenshot : undefined;
+  const auth = isRecord(response.auth) ? response.auth : isRecord(session?.auth) ? session?.auth : undefined;
+  const lines = [fallback];
+  if (id) {
+    lines.push(`Session: ${id}`);
+    lines.push(`Observe: vibecodr browser session observe ${id}`);
+    lines.push(`Watch live: vibecodr browser session live ${id}`);
+    lines.push(`Need to sign in or steer? vibecodr browser session auth ${id}`);
+    lines.push(`Close: vibecodr browser session close ${id}`);
+  }
+  if (auth && typeof auth.status === "string") {
+    lines.push(`Control: ${browserSessionControlLabel(auth.status)}`);
+  }
+  const handoffUrl = browserSessionHandoffUrlFromResponse(response);
+  if (handoffUrl) {
+    lines.push(`Open live page: ${handoffUrl}`);
+  }
+  if (typeof screenshot?.id === "string") {
+    lines.push(`Screenshot proof: vibecodr proof show ${screenshot.id}`);
+  }
+  return lines.join("\n");
+}
+
+function browserSessionControlLabel(status: string): string {
+  if (status === "human_control") return "you are controlling the browser";
+  if (status === "auth_ready") return "agent can continue";
+  if (status === "revoked") return "live link ended";
+  if (status === "handoff_expired") return "watch link expired";
+  if (status === "public") return "agent is browsing";
+  return status;
+}
+
+function browserSessionHandoffUrlFromResponse(response: unknown): string | undefined {
+  if (!isRecord(response)) {
+    return undefined;
+  }
+  const auth = isRecord(response.auth) ? response.auth : undefined;
+  return typeof auth?.handoffUrl === "string" ? auth.handoffUrl : undefined;
 }
 
 function normalizeComputerCommandOptions(parsed: ParsedCommandOptions, missingMessage: string): ParsedCommandOptions {
@@ -2249,6 +2589,24 @@ function buildToolTestPayload(
   parsed: ParsedCommandOptions,
   globalToolTimeoutMs?: number
 ): Record<string, unknown> {
+  if (capability.startsWith("browser.session_")) {
+    const input: Record<string, unknown> = {};
+    if (capability === "browser.session_open") {
+      if (!target) {
+        throw new CliError("input.url_required", "browser.session_open requires an HTTPS URL target.", 2);
+      }
+      input.url = validateBrowserUrl(target);
+      const timeoutMs = validatePositiveInt(getStringFlag(parsed.flags, "timeoutMs"), "--timeout-ms", 1000, 3_600_000);
+      const idleTimeoutMs = validatePositiveInt(getStringFlag(parsed.flags, "idleTimeoutMs"), "--idle-timeout-ms", 1000, 600_000);
+      if (timeoutMs !== undefined) input.timeoutMs = timeoutMs;
+      if (idleTimeoutMs !== undefined) input.idleTimeoutMs = idleTimeoutMs;
+    } else {
+      input.sessionId = validateBrowserSessionId(target);
+      Object.assign(input, browserSessionToolTestActionInput(capability, parsed));
+    }
+    return { capability, input };
+  }
+
   if (capability.startsWith("browser.")) {
     if (!target) {
       throw new CliError("input.url_required", `${capability} requires an HTTPS URL target.`, 2);
@@ -2324,6 +2682,38 @@ function buildToolTestPayload(
   }
 
   return { capability, input: {} };
+}
+
+function browserSessionToolTestActionInput(capability: CapabilityName, parsed: ParsedCommandOptions): Record<string, unknown> {
+  if (capability === "browser.session_observe" || capability === "browser.session_close") {
+    return {};
+  }
+  if (capability === "browser.session_navigate") {
+    const target = getStringFlag(parsed.flags, "url") ?? parsed.positionals[1];
+    if (!target) {
+      throw new CliError("input.url_required", "browser.session_navigate requires an HTTPS URL target.", 2);
+    }
+    return { url: validateBrowserUrl(target) };
+  }
+  if (capability === "browser.session_click") {
+    return { selector: requiredBrowserSessionSelector(parsed, "browser.session_click requires --selector <css>.") };
+  }
+  if (capability === "browser.session_type") {
+    const text = getStringFlag(parsed.flags, "text") ?? parsed.positionals.slice(2).join(" ").trim();
+    if (!text) {
+      throw new CliError("input.text_required", "browser.session_type requires --text <text>.", 2);
+    }
+    return { selector: requiredBrowserSessionSelector(parsed, "browser.session_type requires --selector <css>."), text };
+  }
+  if (capability === "browser.session_scroll") {
+    const deltaY = validateIntegerRange(getStringFlag(parsed.flags, "deltaY") ?? parsed.positionals[1], "--delta-y", -10_000, 10_000);
+    return deltaY === undefined ? {} : { deltaY };
+  }
+  if (capability === "browser.session_wait") {
+    const ms = validateIntegerRange(getStringFlag(parsed.flags, "ms") ?? parsed.positionals[1], "--ms", 1, 30_000);
+    return ms === undefined ? {} : { ms };
+  }
+  return {};
 }
 
 function buildScheduledQaPayload(target: string, parsed: ParsedCommandOptions, globalToolTimeoutMs?: number): Record<string, unknown> {
@@ -3296,6 +3686,9 @@ Usage:
   vibecodr computer status
   vibecodr computer run "<command>" [--timeout-ms <ms>] [--network public|off] [--local|--out ./proof] [--no-wait] [--details]
   vibecodr computer test "<command>" [--timeout-ms <ms>] [--network public|off] [--local|--out ./proof] [--no-wait] [--details]
+
+Notes:
+  Automatic output saves are workspace-bounded. If --out points outside this workspace, vibecodr writes to ./.vibecodr/browser-artifacts/<run> instead.
 `;
     case "browser":
       return `vibecodr browser
@@ -3309,14 +3702,32 @@ Usage:
   vibecodr browser pdf <https-url> [--local|--out ./proof] [--no-wait] [--details]
   vibecodr browser crawl <https-url> [--max-pages n] [--max-depth n] [--local|--out ./proof]
   vibecodr browser snapshot <https-url> [--local|--out ./proof]
+  vibecodr browser session open <https-url> [--timeout-ms <ms>] [--idle-timeout-ms <ms>]
+  vibecodr browser session observe <sessionId>
+  vibecodr browser session goto <sessionId> <https-url>
+  vibecodr browser session click <sessionId> --selector <css>
+  vibecodr browser session type <sessionId> --selector <css> --text <text>
+  vibecodr browser session scroll <sessionId> [--delta-y 800]
+  vibecodr browser session wait <sessionId> [--ms 1000]
+  vibecodr browser session live <sessionId> [--no-open] [--debug|--view devtools]
+  vibecodr browser session auth <sessionId> [--no-open] [--debug|--view devtools]
+  vibecodr browser session auth-status <sessionId>
+  vibecodr browser session auth-complete <sessionId>
+  vibecodr browser session auth-revoke <sessionId>
+  vibecodr browser session close <sessionId>
 
 Attach a note:
   vibecodr browser notes <https-url> --note <text> [--local|--out ./proof]
 
 Notes:
   Add --local to save completed output into ./vibecodr-proof automatically.
+  Automatic output saves are workspace-bounded. If --out points outside this workspace, vibecodr writes to ./.vibecodr/browser-artifacts/<run> instead.
   browser snapshot captures page state; it does not prompt an agent or model.
   browser notes saves your note with the snapshot.
+  browser session opens a real hosted Agent Browser the agent can observe and control until it is closed or idle.
+  browser session live opens the watch-and-intercede page without pausing the agent.
+  browser session auth opens the same live page with human control already active for login, MFA, CAPTCHA, or other human-only steps.
+  Add --debug or --view devtools only when an agent/developer needs the inspector panel instead of the plain browser tab.
 `;
     case "work":
       return `vibecodr work
@@ -3328,6 +3739,9 @@ Usage:
   vibecodr work show <jobId>
   vibecodr work follow <jobId> [--local|--out ./proof] [--details]
   vibecodr work cancel <jobId> --yes
+
+Notes:
+  Automatic output saves are workspace-bounded. If --out points outside this workspace, vibecodr writes to ./.vibecodr/browser-artifacts/<run> instead.
 `;
     case "proof":
       return `vibecodr proof

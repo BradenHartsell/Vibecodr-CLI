@@ -31,7 +31,7 @@ export function validateBrowserUrl(input: string): string {
   }
 
   if (url.username || url.password) {
-    throw new CliError("input.invalid_url", "Blocked for safety: browser URLs cannot include credentials. Use a public page, or connect an authenticated browsing session when that beta is available.", 2);
+    throw new CliError("input.invalid_url", "Blocked for safety: browser URLs cannot include credentials. Use a public page, or open an Agent Browser live session when a human needs to sign in.", 2);
   }
 
   const hostname = normalizedHostname(url.hostname);

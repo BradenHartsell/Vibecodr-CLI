@@ -4,7 +4,7 @@
 
 The official Vibecodr CLI. One package, one install command, one coherent surface for:
 
-- Hosted browser tools (render, screenshot, PDF, crawl, snapshot, ask).
+- Hosted browser tools (render, screenshot, PDF, crawl, snapshot, Agent Browser sessions, and human auth handoff).
 - Hosted computer tools (run, test, work follow, work submit, proof).
 - Capsule uploads (zip + image) into Pulse and the hosted MCP gateway.
 - Pulse lifecycle (setup, publish, list, get, status, run, archive, restore, create, deploy).
@@ -59,6 +59,12 @@ vibecodr install codex
 # 3. Set up the hosted Agent Computer when you want browser/computer work.
 vibecodr start
 vibecodr browser screenshot https://example.com --local
+vibecodr browser session open https://example.com
+vibecodr browser session live job_...
+vibecodr browser session auth job_...   # when the owner needs to sign in or steer
+vibecodr browser session close job_...
+# Use --debug or --view devtools only when the inspector panel is needed.
+vibecodr browser session live job_... --debug
 ```
 
 Power users and automation should prefer the explicit surfaces and stable JSON:

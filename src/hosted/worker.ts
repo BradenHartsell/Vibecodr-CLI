@@ -38,6 +38,7 @@ interface SandboxSdkModule {
 type WorkflowEntrypointConstructor = typeof import("cloudflare:workers").WorkflowEntrypoint;
 type HostedWorkerTestGlobal = typeof globalThis & { __VC_TOOLS_HOSTED_WORKER_TEST__?: boolean };
 type OfferingClassification = (typeof PUBLIC_OFFERING_CLASSIFICATIONS)[number];
+type BrowserSessionLiveViewMode = "tab" | "devtools";
 
 class LocalWorkflowEntrypoint<Env = unknown> {
   protected ctx: ExecutionContext;
@@ -68,10 +69,25 @@ const MAX_BROWSER_AGENT_TASK_TIMEOUT_MS = 3_600_000;
 const DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS = 600_000;
 const BROWSER_SESSION_KEEP_ALIVE_MIN_MS = 10_000;
 const BROWSER_SESSION_KEEP_ALIVE_MAX_MS = 600_000;
+const BROWSER_SESSION_HANDOFF_TOKEN_HEADER = "x-vibecodr-handoff-token";
 const BROWSER_NAVIGATION_WAIT_UNTIL = "networkidle2";
 const MAX_BROWSER_AGENT_ACTIONS = 50;
 const BROWSER_QUICK_ACTION_GOTO_TIMEOUT_MAX_MS = 60_000;
 const BROWSER_QUICK_ACTION_ACTION_TIMEOUT_MAX_MS = 300_000;
+const BROWSER_READ_MIN_ROOT_TEXT_CHARS = 120;
+const BROWSER_READ_ROOT_SELECTORS = [
+  "main article",
+  "[role='main'] article",
+  "article",
+  "[data-docs-content]",
+  "[data-pagefind-body]",
+  ".docs-content",
+  ".main-content",
+  "#main-content",
+  "#content",
+  "main",
+  "[role='main']"
+] as const;
 const DEFAULT_BROWSER_CRAWL_PAGES_PER_RUN = 10;
 const MAX_BROWSER_CRAWL_PAGES_PER_RUN = 250;
 const DEFAULT_BROWSER_CRAWL_DEPTH = 1;
@@ -231,6 +247,7 @@ type HostedEnv = Omit<
   Env,
   | "VC_TOOLS_PROVIDER_MODE"
   | "VC_TOOLS_PUBLIC_BASE_URL"
+  | "VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL"
   | "VC_TOOLS_PLAN_NAME"
   | "VC_TOOLS_TOKEN_SHA256"
   | "VC_TOOLS_CLI_GRANT_PUBLIC_JWKS"
@@ -276,6 +293,7 @@ type HostedEnv = Omit<
   | "ProSandbox"
 > & {
   VC_TOOLS_PUBLIC_BASE_URL?: string;
+  VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL?: string;
   VC_TOOLS_PROVIDER_MODE?: ProviderMode;
   VC_TOOLS_PLAN_NAME?: string;
   VC_TOOLS_TOKEN_SHA256?: string;
@@ -375,7 +393,7 @@ type CliGrantPublicJwk = JsonWebKey & {
   kid: string;
 };
 
-type NormalizedToolInput = BrowserToolInput | SandboxToolInput | ArtifactToolInput | JobToolInput;
+type NormalizedToolInput = BrowserToolInput | BrowserSessionToolInput | SandboxToolInput | ArtifactToolInput | JobToolInput;
 
 interface BrowserToolInput {
   kind: "browser";
@@ -389,6 +407,15 @@ interface BrowserToolInput {
   instructions?: string;
   idleTimeoutMs?: number;
   actions?: BrowserAgentAction[];
+}
+
+interface BrowserSessionToolInput {
+  kind: "browser-session";
+  sessionId?: string;
+  url?: string;
+  timeoutMs?: number;
+  idleTimeoutMs?: number;
+  action?: BrowserAgentAction;
 }
 
 type ScheduledQaCapability =
@@ -547,7 +574,26 @@ const BROWSER_RUN_CAPABILITIES = new Set<CapabilityName>([
   "browser.render_pdf",
   "browser.crawl_site"
 ]);
-const BROWSER_SESSION_CAPABILITIES = new Set<CapabilityName>(["browser.agent_task"]);
+const BROWSER_SESSION_CONTROL_CAPABILITIES = new Set<CapabilityName>([
+  "browser.session_open",
+  "browser.session_observe",
+  "browser.session_navigate",
+  "browser.session_click",
+  "browser.session_type",
+  "browser.session_scroll",
+  "browser.session_wait",
+  "browser.session_close"
+]);
+const BROWSER_SESSION_AUTH_CAPABILITIES = new Set<CapabilityName>([
+  "browser.session_auth_request",
+  "browser.session_auth_status",
+  "browser.session_auth_complete",
+  "browser.session_auth_revoke"
+]);
+const BROWSER_SESSION_CAPABILITIES = new Set<CapabilityName>(["browser.agent_task", ...BROWSER_SESSION_CONTROL_CAPABILITIES, ...BROWSER_SESSION_AUTH_CAPABILITIES]);
+const BROWSER_SESSION_JOB_CAPABILITIES = new Set<CapabilityName>(["browser.agent_task", "browser.session_open"]);
+const BROWSER_SESSION_HANDOFF_TTL_MS = 15 * 60_000;
+const BROWSER_SESSION_LIVE_VIEW_URL_TTL_MS = 5 * 60_000;
 const SCHEDULED_QA_CAPABILITIES = new Set<ScheduledQaCapability>([
   "browser.render_url",
   "browser.screenshot_url",
@@ -572,6 +618,18 @@ const AGENT_TOOL_NAMES: Array<{ name: string; capability: CapabilityName }> = [
   { name: "browser.pdf", capability: "browser.render_pdf" },
   { name: "browser.crawl", capability: "browser.crawl_site" },
   { name: "browser.snapshot", capability: "browser.agent_task" },
+  { name: "browser.session.open", capability: "browser.session_open" },
+  { name: "browser.session.observe", capability: "browser.session_observe" },
+  { name: "browser.session.goto", capability: "browser.session_navigate" },
+  { name: "browser.session.click", capability: "browser.session_click" },
+  { name: "browser.session.type", capability: "browser.session_type" },
+  { name: "browser.session.scroll", capability: "browser.session_scroll" },
+  { name: "browser.session.wait", capability: "browser.session_wait" },
+  { name: "browser.session.auth.request", capability: "browser.session_auth_request" },
+  { name: "browser.session.auth.status", capability: "browser.session_auth_status" },
+  { name: "browser.session.auth.complete", capability: "browser.session_auth_complete" },
+  { name: "browser.session.auth.revoke", capability: "browser.session_auth_revoke" },
+  { name: "browser.session.close", capability: "browser.session_close" },
   { name: "computer.run", capability: "sandbox.run_command" },
   { name: "computer.test", capability: "sandbox.run_tests" },
   { name: "proof.get", capability: "artifact.get" },
@@ -717,6 +775,22 @@ async function handleRequest(request: Request, env: HostedEnv, ctx: ExecutionCon
     return mcpResponse(request, env, ctx);
   }
 
+  const browserHandoffMatch = /^\/browser\/handoff\/([^/]+)$/.exec(path);
+  if (browserHandoffMatch?.[1] && method === "GET") {
+    return browserSessionHandoffPageResponse(decodeURIComponent(browserHandoffMatch[1]), url, env, request);
+  }
+
+  const browserHandoffActionMatch = /^\/browser\/handoff\/([^/]+)\/(take-control|complete|revoke|close)$/.exec(path);
+  if (browserHandoffActionMatch?.[1] && browserHandoffActionMatch[2] && method === "POST") {
+    return browserSessionHandoffActionResponse(
+      decodeURIComponent(browserHandoffActionMatch[1]),
+      browserHandoffActionMatch[2] as BrowserSessionHandoffAction,
+      url,
+      env,
+      request
+    );
+  }
+
   const auth = await authenticate(request, env);
   if (!auth.ok) {
     recordAuthFailureMetric(env, ctx, request, auth);
@@ -759,6 +833,92 @@ async function handleRequest(request: Request, env: HostedEnv, ctx: ExecutionCon
       protocolVersion: MCP_PROTOCOL_VERSION,
       ...(surface.operator ? { providerMode: mode } : {})
     }, 200, request);
+  }
+
+  if (method === "POST" && path === "/v1/browser/sessions") {
+    const body = await readJsonObject(request, MAX_JSON_BODY_BYTES);
+    const capability: CapabilityName = "browser.session_open";
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, isRecord(body) ? body : {}, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await executeLiveBrowserSessionToolCall(live, capability, input, env, request, auth), 201, request);
+  }
+
+  const browserSessionMatch = /^\/v1\/browser\/sessions\/([^/]+)$/.exec(path);
+  if (browserSessionMatch?.[1] && method === "GET") {
+    const capability: CapabilityName = "browser.session_observe";
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, { sessionId: decodeURIComponent(browserSessionMatch[1]) }, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await executeLiveBrowserSessionToolCall(live, capability, input, env, request, auth), 200, request);
+  }
+
+  if (browserSessionMatch?.[1] && method === "DELETE") {
+    const capability: CapabilityName = "browser.session_close";
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, { sessionId: decodeURIComponent(browserSessionMatch[1]) }, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await executeLiveBrowserSessionToolCall(live, capability, input, env, request, auth), 200, request);
+  }
+
+  const browserSessionActionMatch = /^\/v1\/browser\/sessions\/([^/]+)\/actions$/.exec(path);
+  if (browserSessionActionMatch?.[1] && method === "POST") {
+    const body = await readJsonObject(request, MAX_JSON_BODY_BYTES);
+    const actionName = typeof body.action === "string" ? body.action : "";
+    const capability = browserSessionActionCapability(actionName);
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, {
+      ...body,
+      sessionId: decodeURIComponent(browserSessionActionMatch[1])
+    }, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await executeLiveBrowserSessionToolCall(live, capability, input, env, request, auth), 200, request);
+  }
+
+  const browserSessionLiveMatch = /^\/v1\/browser\/sessions\/([^/]+)\/live$/.exec(path);
+  if (browserSessionLiveMatch?.[1] && method === "POST") {
+    const capability: CapabilityName = "browser.session_auth_request";
+    const viewMode = browserSessionLiveViewModeFromUrl(url);
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, { sessionId: decodeURIComponent(browserSessionLiveMatch[1]) }, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await requestLiveBrowserSessionView(live, input, env, request, auth, viewMode), 200, request);
+  }
+
+  const browserSessionAuthMatch = /^\/v1\/browser\/sessions\/([^/]+)\/auth(?:\/(complete|revoke))?$/.exec(path);
+  if (browserSessionAuthMatch?.[1]) {
+    const suffix = browserSessionAuthMatch[2];
+    const capability: CapabilityName =
+      method === "GET" ? "browser.session_auth_status" :
+        suffix === "complete" ? "browser.session_auth_complete" :
+          suffix === "revoke" ? "browser.session_auth_revoke" :
+            "browser.session_auth_request";
+    if (method !== "GET" && method !== "POST") {
+      return json({ code: "method.not_allowed", message: "Agent Browser live control supports GET status and POST mutations." }, 405, request);
+    }
+    const viewMode = browserSessionLiveViewModeFromUrl(url);
+    const input = asBrowserSessionToolInput(await normalizeHostedToolInputWithDenialMetrics(capability, { sessionId: decodeURIComponent(browserSessionAuthMatch[1]) }, env, request, auth));
+    await ensureCapabilityAllowedWithDenialMetrics(auth, env, request, capability);
+    if (mode !== "live") {
+      return json(contractBrowserSessionResponse(capability, input, env), 202, request);
+    }
+    const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+    return json(await executeLiveBrowserSessionAuthToolCall(live, capability, input, env, request, auth, viewMode), 200, request);
   }
 
   if (method === "GET" && path === "/v1/tools") {
@@ -1409,6 +1569,500 @@ async function dashboardResponse(path: string, env: HostedEnv, request: Request,
   });
 }
 
+async function browserSessionHandoffPageResponse(sessionIdInput: string, url: URL, env: HostedEnv, request: Request): Promise<Response> {
+  const live = requireLiveBindings(env, ["DB"]);
+  const token = browserSessionHandoffTokenFromRequest(request, url);
+  const { state } = await verifiedBrowserSessionHandoff(live.DB, sessionIdInput, token);
+  const viewMode = browserSessionLiveViewModeFromUrl(url);
+  const liveView = await browserSessionLiveViewTarget(env, state, viewMode).catch((error) => ({
+    error: redactBrowserSessionCredentialText(
+      error instanceof HostedError
+        ? error.message
+        : "Live View could not be prepared for this browser session."
+    )
+  }));
+  if (requestPrefersJson(request)) {
+    return json(browserSessionHandoffJson(state, redactBrowserSessionLiveViewTarget(liveView)), 200, request);
+  }
+  return browserSessionHandoffHtmlResponse(
+    renderBrowserSessionHandoffPage(state, token, redactBrowserSessionLiveViewTarget(liveView)),
+    200,
+    request
+  );
+}
+
+type BrowserSessionHandoffAction = "take-control" | "complete" | "revoke" | "close";
+
+async function browserSessionHandoffActionResponse(
+  sessionIdInput: string,
+  action: BrowserSessionHandoffAction,
+  url: URL,
+  env: HostedEnv,
+  request: Request
+): Promise<Response> {
+  const live = requireLiveBindings(env, action === "close" ? ["DB", "ARTIFACTS", "BROWSER"] : ["DB"]);
+  const token = browserSessionHandoffTokenFromRequest(request, url);
+  const { row, state } = await verifiedBrowserSessionHandoff(live.DB, sessionIdInput, token);
+  const auth = browserSessionHandoffAuthContext(row);
+  const viewMode = browserSessionLiveViewModeFromUrl(url);
+  const result = action === "take-control"
+    ? await takeControlLiveBrowserSession(live, row, state, env, request, auth, "handoff")
+    : action === "complete"
+      ? await completeLiveBrowserSessionAuth(live, row, state, env, request, auth, "handoff")
+      : action === "revoke"
+        ? await revokeLiveBrowserSessionAuth(live, row, state, env, request, auth, "handoff")
+        : await closeLiveBrowserSession(live, row, state, env, request, auth);
+  const liveView = action === "revoke" || action === "close"
+    ? {}
+    : await browserSessionLiveViewTarget(env, state, viewMode).catch((error) => ({
+      error: redactBrowserSessionCredentialText(
+        error instanceof HostedError
+          ? error.message
+          : "Live View could not be prepared for this browser session."
+      )
+    }));
+  const safeResult = redactBrowserSessionHandoffResult(result);
+  const safeLiveView = redactBrowserSessionLiveViewTarget(liveView);
+  const resultSession = isRecord(result.session) ? result.session : {};
+  const resultAuth = isRecord(result.auth)
+    ? result.auth
+    : isRecord(resultSession.auth)
+      ? resultSession.auth
+      : browserSessionAuthPublic(state);
+  if (requestPrefersJson(request)) {
+    return json({
+      ok: true,
+      ...safeResult,
+      action,
+      auth: resultAuth,
+      status: action === "close" ? "closed" : result.status,
+      ...(action === "revoke" || action === "close" ? {} : { liveView: safeLiveView })
+    }, 200, request);
+  }
+  return browserSessionHandoffHtmlResponse(renderBrowserSessionHandoffDonePage(safeResult, action), 200, request);
+}
+
+async function verifiedBrowserSessionHandoff(
+  db: D1Database,
+  sessionIdInput: string,
+  token: string
+): Promise<{ row: JobRow; state: BrowserSessionStoredState }> {
+  const sessionId = normalizeBrowserSessionId(sessionIdInput);
+  const row = await readBrowserSessionHandoffJobRow(db, sessionId);
+  assertOpenBrowserSessionRow(row);
+  const state = browserSessionStateFromRow(row);
+  if (!state.handoffTokenHash || !state.handoffTokenExpiresAt || state.authState === "revoked") {
+    throw new HostedError(410, "browser_session.handoff_not_active", "This Agent Browser live link is no longer active.");
+  }
+  if (isExpiredIso(state.handoffTokenExpiresAt)) {
+    throw new HostedError(410, "browser_session.handoff_expired", "This Agent Browser live link expired. Ask the agent to request a fresh link.");
+  }
+  const actualHash = await browserSessionHandoffTokenHash(token);
+  if (!timingSafeEqualHex(actualHash, state.handoffTokenHash)) {
+    throw new HostedError(403, "browser_session.invalid_handoff", "This Agent Browser live link is invalid or expired.");
+  }
+  return { row, state };
+}
+
+async function readBrowserSessionHandoffJobRow(db: D1Database, sessionId: string): Promise<JobRow> {
+  const row = await db.prepare(
+    "SELECT id, actor_id, plan_name, capability, status, input_json, result_json, error_code, error_message, provider_mode, queue_global_ahead, queue_actor_ahead, queue_delay_seconds, created_at, updated_at, started_at, completed_at, canceled_at FROM jobs WHERE id = ? AND capability = 'browser.session_open'"
+  ).bind(sessionId).first<JobRow>();
+  if (!row) {
+    throw new HostedError(404, "browser_session.not_found", "Agent Browser session was not found.");
+  }
+  return row;
+}
+
+interface BrowserSessionLiveViewTarget {
+  liveViewUrl?: string | undefined;
+  viewMode?: BrowserSessionLiveViewMode | undefined;
+  targetTitle?: string | undefined;
+  targetUrl?: string | undefined;
+  urlExpiresAt?: string | undefined;
+  error?: string | undefined;
+}
+
+const BROWSER_SESSION_SENSITIVE_QUERY_KEYS = /^(access_token|auth|authorization|code|credential|id_token|jwt|key|password|refresh_token|secret|session|sig|signature|state|token)$/i;
+const BROWSER_SESSION_URL_IN_TEXT_PATTERN = /https?:\/\/[^\s<>"')\]]+/g;
+const BROWSER_SESSION_BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
+const BROWSER_SESSION_HANDOFF_TOKEN_PATTERN = /\bvbha_[A-Za-z0-9_-]{32,160}\b/g;
+const BROWSER_SESSION_TOKEN_ASSIGNMENT_PATTERN = /\b([A-Za-z0-9_-]*(?:access[_-]?token|auth|authorization|code|credential|id[_-]?token|jwt|key|password|refresh[_-]?token|secret|session|sig|signature|state|token)[A-Za-z0-9_-]*)(=|%3D)[^&#\s"'<>]+/gi;
+
+function redactBrowserSessionUrlForUser(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.hash = "";
+    for (const key of Array.from(url.searchParams.keys())) {
+      if (BROWSER_SESSION_SENSITIVE_QUERY_KEYS.test(key)) {
+        url.searchParams.set(key, "[redacted]");
+      }
+    }
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function redactBrowserSessionCredentialText(value: string): string {
+  return value
+    .replace(BROWSER_SESSION_URL_IN_TEXT_PATTERN, (match) => redactBrowserSessionUrlForUser(match))
+    .replace(BROWSER_SESSION_BEARER_PATTERN, "Bearer [redacted]")
+    .replace(BROWSER_SESSION_HANDOFF_TOKEN_PATTERN, "[redacted]")
+    .replace(BROWSER_SESSION_TOKEN_ASSIGNMENT_PATTERN, "$1$2[redacted]");
+}
+
+function redactBrowserSessionTextValue(value: string | null | undefined): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  return redactBrowserSessionCredentialText(value);
+}
+
+function redactBrowserSessionLiveViewTarget(liveView: BrowserSessionLiveViewTarget): BrowserSessionLiveViewTarget {
+  return {
+    ...liveView,
+    targetTitle: redactBrowserSessionTextValue(liveView.targetTitle),
+    targetUrl:
+      typeof liveView.targetUrl === "string"
+        ? redactBrowserSessionUrlForUser(liveView.targetUrl)
+        : undefined,
+    error: redactBrowserSessionTextValue(liveView.error)
+  };
+}
+
+function redactBrowserSessionPublicSession(session: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...session,
+    ...(typeof session.url === "string" ? { url: redactBrowserSessionUrlForUser(session.url) } : {}),
+    ...(typeof session.title === "string" ? { title: redactBrowserSessionCredentialText(session.title) } : {})
+  };
+}
+
+function redactBrowserSessionObservation(observation: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...observation,
+    ...(typeof observation.url === "string"
+      ? { url: redactBrowserSessionUrlForUser(observation.url) }
+      : {}),
+    ...(typeof observation.title === "string"
+      ? { title: redactBrowserSessionCredentialText(observation.title) }
+      : {}),
+    ...(Array.isArray(observation.links)
+      ? {
+        links: observation.links.map((link) =>
+          isRecord(link)
+            ? {
+              ...link,
+              ...(typeof link.href === "string"
+                ? { href: redactBrowserSessionUrlForUser(link.href) }
+                : {}),
+              ...(typeof link.text === "string"
+                ? { text: redactBrowserSessionCredentialText(link.text) }
+                : {})
+            }
+            : link
+        )
+      }
+      : {})
+  };
+}
+
+function redactBrowserSessionHandoffResult(result: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...result,
+    ...(isRecord(result.session) ? { session: redactBrowserSessionPublicSession(result.session) } : {}),
+    ...(isRecord(result.observation)
+      ? { observation: redactBrowserSessionObservation(result.observation) }
+      : {})
+  };
+}
+
+async function browserSessionLiveViewTarget(env: HostedEnv, state: BrowserSessionStoredState, viewMode: BrowserSessionLiveViewMode = "tab"): Promise<BrowserSessionLiveViewTarget> {
+  const config = ensureBrowserSessionHandoffConfigured(env);
+  const url = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}/browser-rendering/devtools/browser/${encodeURIComponent(state.providerSessionId)}/json/list`;
+  const response = await fetchBrowserQuickAction(config, url, { method: "GET" });
+  const payload = await response.json().catch(() => undefined);
+  const rawTargets = Array.isArray(payload)
+    ? payload
+    : isRecord(payload) && Array.isArray(payload.result)
+      ? payload.result
+      : [];
+  const targets = rawTargets.filter(isRecord);
+  const target = targets.find((item) => item.type === "page" && typeof item.devtoolsFrontendUrl === "string" && item.url !== "about:blank")
+    ?? targets.find((item) => typeof item.devtoolsFrontendUrl === "string");
+  if (!target || typeof target.devtoolsFrontendUrl !== "string") {
+    return { error: "No live browser tab is available yet. Refresh this page in a moment." };
+  }
+  const liveViewUrl = browserSessionLiveViewUrl(target.devtoolsFrontendUrl, viewMode);
+  if (!liveViewUrl) {
+    return { error: "The live browser URL was not recognized. Refresh this page in a moment." };
+  }
+  return {
+    liveViewUrl,
+    viewMode,
+    targetTitle: redactBrowserSessionTextValue(typeof target.title === "string" ? target.title : undefined),
+    targetUrl: typeof target.url === "string" ? redactBrowserSessionUrlForUser(target.url) : undefined,
+    urlExpiresAt: addMillisecondsIso(nowIso(), BROWSER_SESSION_LIVE_VIEW_URL_TTL_MS)
+  };
+}
+
+function browserSessionLiveViewUrl(input: string, viewMode: BrowserSessionLiveViewMode): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "live.browser.run") {
+    return undefined;
+  }
+  if (url.pathname !== "/ui/view" && url.pathname !== "/ui/inspector") {
+    return undefined;
+  }
+  if (url.pathname === "/ui/inspector") {
+    url.pathname = "/ui/view";
+  }
+  url.searchParams.set("mode", viewMode);
+  return url.toString();
+}
+
+function browserSessionLiveViewModeFromUrl(url: URL): BrowserSessionLiveViewMode {
+  const raw = (url.searchParams.get("view") ?? url.searchParams.get("mode") ?? "").trim().toLowerCase();
+  if (!raw || raw === "tab" || raw === "browser") {
+    return "tab";
+  }
+  if (raw === "devtools" || raw === "debug" || raw === "inspector") {
+    return "devtools";
+  }
+  throw new HostedError(400, "input.invalid_live_view_mode", "Agent Browser live view mode must be tab or devtools.");
+}
+
+function requestPrefersJson(request: Request): boolean {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.split(",").some((part) => part.trim().toLowerCase().startsWith("application/json"));
+}
+
+function ensureBrowserSessionHandoffConfigured(env: HostedEnv): BrowserQuickActionConfig {
+  const config = browserQuickActionConfig(env);
+  if (!config) {
+    throw new HostedError(503, "live.browser_handoff_not_configured", "Agent Browser Live requires Browser Run account id and API token secrets so Vibecodr can mint a fresh Live View URL.");
+  }
+  return config;
+}
+
+function browserSessionHandoffTokenFromRequest(request: Request, url: URL): string {
+  const token = request.headers.get(BROWSER_SESSION_HANDOFF_TOKEN_HEADER) ?? url.searchParams.get("token") ?? "";
+  if (!/^vbha_[A-Za-z0-9_-]{32,160}$/.test(token)) {
+    throw new HostedError(403, "browser_session.invalid_handoff", "This Agent Browser live link is invalid or expired.");
+  }
+  return token;
+}
+
+function browserSessionHandoffToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `vbha_${bytesToBase64Url(bytes)}`;
+}
+
+async function browserSessionHandoffTokenHash(token: string): Promise<string> {
+  return sha256(`browser-session-handoff:${token}`);
+}
+
+function browserSessionHandoffUrl(env: HostedEnv, sessionId: string, token: string, viewMode: BrowserSessionLiveViewMode = "tab"): string {
+  const uiBase = browserSessionHandoffUiBase(env);
+  if (uiBase) {
+    const url = new URL(uiBase);
+    url.pathname = `/agent-browser/live/${encodeURIComponent(sessionId)}`;
+    url.search = "";
+    const hash = new URLSearchParams({ token });
+    if (viewMode === "devtools") {
+      hash.set("view", "devtools");
+    }
+    url.hash = hash.toString();
+    return url.toString();
+  }
+  const url = new URL(publicBase(env));
+  url.pathname = `/browser/handoff/${encodeURIComponent(sessionId)}`;
+  url.search = "";
+  url.searchParams.set("token", token);
+  if (viewMode === "devtools") {
+    url.searchParams.set("view", "devtools");
+  }
+  return url.toString();
+}
+
+function browserSessionHandoffUiBase(env: Pick<HostedEnv, "VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL">): string | null {
+  const raw = env.VC_TOOLS_BROWSER_HANDOFF_UI_BASE_URL?.trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function browserSessionHandoffAuthContext(row: JobRow): AuthContext {
+  return {
+    ok: true,
+    actorId: row.actor_id,
+    tokenKind: "cli_grant",
+    planName: row.plan_name,
+    scopes: [VC_TOOLS_GRANT_SCOPE]
+  };
+}
+
+function renderBrowserSessionHandoffPage(
+  state: BrowserSessionStoredState,
+  token: string,
+  liveView: BrowserSessionLiveViewTarget
+): string {
+  const takeControlAction = `/browser/handoff/${encodeURIComponent(state.sessionId)}/take-control?token=${encodeURIComponent(token)}`;
+  const completeAction = `/browser/handoff/${encodeURIComponent(state.sessionId)}/complete?token=${encodeURIComponent(token)}`;
+  const closeAction = `/browser/handoff/${encodeURIComponent(state.sessionId)}/close?token=${encodeURIComponent(token)}`;
+  const liveLink = liveView.liveViewUrl
+    ? `<a class="primary" href="${escapeHtml(liveView.liveViewUrl)}" target="_blank" rel="noopener noreferrer">Open live browser</a>`
+    : `<p class="notice">${escapeHtml(liveView.error ?? "Live View is not ready yet. Refresh this page in a moment.")}</p>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agent Browser Live</title>
+  <style>
+    body { margin: 0; background: #f8f5ef; color: #202636; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { margin: 0 auto; max-width: 720px; padding: 48px 20px; }
+    section { background: #fffaf3; border: 1px solid #eaded0; border-radius: 8px; box-shadow: 0 20px 60px rgba(32, 38, 54, 0.12); padding: 28px; }
+    .eyebrow { color: #cf4425; font-size: 12px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { font-size: clamp(32px, 7vw, 56px); line-height: .95; margin: 12px 0 18px; }
+    p { color: #536071; font-size: 17px; line-height: 1.55; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin: 24px 0; }
+    .primary, button { border: 0; border-radius: 999px; cursor: pointer; display: inline-flex; font: inherit; font-weight: 800; padding: 13px 18px; text-decoration: none; }
+    .primary, button[type="submit"] { background: #f25a38; color: #111827; }
+    .secondary { background: transparent; border: 1px solid #d9cec2; color: #202636; }
+    .notice { background: #fff1dc; border-left: 4px solid #f25a38; color: #5f4a35; padding: 12px 14px; }
+    .fine { font-size: 14px; color: #697386; }
+    code { background: #efe8de; border-radius: 5px; padding: 2px 5px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <div class="eyebrow">Vibecodr Agent Browser</div>
+      <h1>Watch the hosted browser live.</h1>
+      <p>Open the live browser to watch the agent work. Take control whenever you need to steer, sign in, finish MFA, or solve a human-only prompt, then hand it back to the agent. Do not paste passwords, cookies, or recovery codes into the CLI or chat.</p>
+      <div class="actions">${liveLink}</div>
+      <p class="fine">Live View links are short-lived, so refreshing this Vibecodr page mints a fresh Cloudflare view URL while this live link is active. Session: <code>${escapeHtml(state.sessionId)}</code></p>
+      <form class="actions" method="post" action="${escapeHtml(takeControlAction)}">
+        <button type="submit">Take control</button>
+      </form>
+      <form class="actions" method="post" action="${escapeHtml(completeAction)}">
+        <button type="submit">Give control back to agent</button>
+      </form>
+      <form class="actions" method="post" action="${escapeHtml(closeAction)}">
+        <button class="secondary" type="submit">End browser</button>
+      </form>
+      <p class="fine">After you give control back, keep this page open to watch the agent continue in the same hosted browser. End the browser when the cloud session should stop.</p>
+      ${liveView.targetUrl ? `<p class="fine">Current tab: ${escapeHtml(liveView.targetTitle ?? "Untitled")} at ${escapeHtml(liveView.targetUrl)}</p>` : ""}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function browserSessionHandoffJson(
+  state: BrowserSessionStoredState,
+  liveView: BrowserSessionLiveViewTarget
+): Record<string, unknown> {
+  const auth = browserSessionAuthPublic(state);
+  return {
+    ok: true,
+    id: state.sessionId,
+    session: {
+      id: state.sessionId,
+      status: state.status,
+      url: redactBrowserSessionUrlForUser(state.currentUrl),
+      title: redactBrowserSessionTextValue(state.title),
+      updatedAt: state.updatedAt,
+      expiresAt: state.expiresAt,
+      auth
+    },
+    status: auth.status,
+    auth,
+    liveView: {
+      liveViewUrl: liveView.liveViewUrl,
+      viewMode: liveView.viewMode,
+      targetTitle: redactBrowserSessionTextValue(liveView.targetTitle),
+      targetUrl:
+        typeof liveView.targetUrl === "string"
+          ? redactBrowserSessionUrlForUser(liveView.targetUrl)
+          : undefined,
+      urlExpiresAt: liveView.urlExpiresAt,
+      error: redactBrowserSessionTextValue(liveView.error)
+    }
+  };
+}
+
+function renderBrowserSessionHandoffDonePage(result: Record<string, unknown>, action: BrowserSessionHandoffAction): string {
+  const session = isRecord(result.session) ? result.session : {};
+  const auth = isRecord(result.auth) ? result.auth : {};
+  const title = action === "take-control" ? "You have control." : action === "complete" ? "Control returned." : action === "close" ? "Browser ended." : "Live link ended.";
+  const detail = action === "take-control"
+    ? "Agent controls are paused until you give control back."
+    : action === "complete"
+      ? "The agent can continue in this hosted browser session while this live page remains available."
+      : action === "close"
+        ? "The cloud browser is closed. Ask the agent to open a new Agent Browser when it needs to keep working."
+        : "The agent will not continue with this live control link unless a fresh link is requested.";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { margin: 0; background: #f8f5ef; color: #202636; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { margin: 0 auto; max-width: 640px; padding: 56px 20px; }
+    section { background: #fffaf3; border: 1px solid #eaded0; border-radius: 8px; padding: 28px; }
+    h1 { font-size: clamp(32px, 7vw, 52px); line-height: 1; margin: 0 0 16px; }
+    p { color: #536071; font-size: 17px; line-height: 1.55; }
+    code { background: #efe8de; border-radius: 5px; padding: 2px 5px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section>
+      <h1>${escapeHtml(title)}</h1>
+      <p>${escapeHtml(detail)}</p>
+      <p>Status: <code>${escapeHtml(String(auth.status ?? result.status ?? "updated"))}</code></p>
+      ${typeof session.id === "string" ? `<p>Session: <code>${escapeHtml(session.id)}</code></p>` : ""}
+    </section>
+  </main>
+</body>
+</html>`;
+}
+
+function browserSessionHandoffHtmlResponse(html: string, status: number, request: Request): Response {
+  return new Response(html, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow, noarchive",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; navigate-to 'self' https://live.browser.run",
+      ...corsHeaders(request)
+    }
+  });
+}
+
 async function mcpResponse(request: Request, env: HostedEnv, ctx: ExecutionContext): Promise<Response> {
   if (request.method === "GET") {
     return json({
@@ -1799,6 +2453,18 @@ async function enqueueLiveToolJob(
 
 async function acceptLiveToolCall(capability: CapabilityName, input: NormalizedToolInput, env: HostedEnv, request: Request, auth: AuthContext): Promise<Record<string, unknown>> {
   const live = requireLiveBindings(env, requiredBindingsForCapability(capability));
+  if (BROWSER_SESSION_CONTROL_CAPABILITIES.has(capability)) {
+    if (input.kind !== "browser-session") {
+      throw new HostedError(400, "input.invalid_browser_session", "Agent Browser session input was not normalized.");
+    }
+    return executeLiveBrowserSessionToolCall(live, capability, input, env, request, auth);
+  }
+  if (BROWSER_SESSION_AUTH_CAPABILITIES.has(capability)) {
+    if (input.kind !== "browser-session") {
+      throw new HostedError(400, "input.invalid_browser_session", "Agent Browser session auth input was not normalized.");
+    }
+    return executeLiveBrowserSessionAuthToolCall(live, capability, input, env, request, auth);
+  }
   const accepted = await enqueueLiveToolJob(live, capability, input, env, request, auth, "tools");
 
   return {
@@ -1811,6 +2477,832 @@ async function acceptLiveToolCall(capability: CapabilityName, input: NormalizedT
     providerMode: "live",
     message: "Accepted for live hosted execution."
   };
+}
+
+interface BrowserSessionStoredState {
+  sessionId: string;
+  providerSessionId: string;
+  requestedUrl: string;
+  currentUrl: string;
+  title: string | null;
+  status: "running" | "completed" | "failed";
+  authState?: BrowserSessionAuthState | undefined;
+  handoffRequestedAt?: string | undefined;
+  handoffUpdatedAt?: string | undefined;
+  handoffTokenHash?: string | undefined;
+  handoffTokenExpiresAt?: string | undefined;
+  handoffCompletedAt?: string | undefined;
+  handoffRevokedAt?: string | undefined;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  timeoutMs: number;
+  idleTimeoutMs: number;
+  actionCount: number;
+  observationCount: number;
+  lastArtifactId?: string | undefined;
+  closeReason?: string | undefined;
+}
+
+type BrowserSessionAuthState = "public" | "human_control" | "auth_ready" | "revoked";
+
+interface BrowserSessionObservation {
+  observedAt: string;
+  url: string;
+  title: string | null;
+  text: string;
+  links: Array<{ text: string; href: string }>;
+  screenshot: Record<string, unknown>;
+}
+
+type BrowserSessionPage = BrowserAgentPageActions & {
+  setDefaultNavigationTimeout(ms: number): void;
+  screenshot(options?: { type?: "png" | "jpeg"; fullPage?: boolean }): Promise<Uint8Array | ArrayBuffer>;
+};
+
+type BrowserSessionBrowser = {
+  sessionId?: () => string;
+  newPage(): Promise<BrowserSessionPage>;
+  pages?: () => Promise<BrowserSessionPage[]>;
+  disconnect?: () => Promise<void>;
+  close(): Promise<void>;
+};
+
+function contractBrowserSessionResponse(capability: CapabilityName, input: NormalizedToolInput, env: HostedEnv): Record<string, unknown> {
+  return {
+    id: input.kind === "browser-session" && input.sessionId ? input.sessionId : `job_${crypto.randomUUID()}`,
+    status: "contract_only",
+    capability,
+    quotaChecked: true,
+    auditLogged: true,
+    providerMode: providerMode(env),
+    message: "Agent Browser sessions require the live hosted provider."
+  };
+}
+
+function asBrowserSessionToolInput(input: NormalizedToolInput): BrowserSessionToolInput {
+  if (input.kind !== "browser-session") {
+    throw new HostedError(400, "input.invalid_browser_session", "Agent Browser session input was not normalized.");
+  }
+  return input;
+}
+
+function browserSessionActionCapability(action: string): CapabilityName {
+  if (action === "goto" || action === "navigate") return "browser.session_navigate";
+  if (action === "click") return "browser.session_click";
+  if (action === "type") return "browser.session_type";
+  if (action === "scroll") return "browser.session_scroll";
+  if (action === "wait") return "browser.session_wait";
+  throw new HostedError(400, "input.invalid_browser_session_action", "Agent Browser action must be goto, navigate, click, type, scroll, or wait.");
+}
+
+async function executeLiveBrowserSessionToolCall(
+  live: RequiredLiveBindings,
+  capability: CapabilityName,
+  input: BrowserSessionToolInput,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext
+): Promise<Record<string, unknown>> {
+  if (capability === "browser.session_open") {
+    return openLiveBrowserSession(live, input, env, request, auth);
+  }
+
+  const sessionId = input.sessionId;
+  if (!sessionId) {
+    throw new HostedError(400, "input.session_id_required", "Agent Browser session id is required.");
+  }
+  const row = await readBrowserSessionJobRow(live.DB, sessionId, auth);
+  assertOpenBrowserSessionRow(row);
+  const state = browserSessionStateFromRow(row);
+  if (capability === "browser.session_close") {
+    return closeLiveBrowserSession(live, row, state, env, request, auth);
+  }
+  if (capability === "browser.session_observe") {
+    return observeLiveBrowserSession(live, row, state, env, request, auth);
+  }
+  if (!input.action) {
+    throw new HostedError(400, "input.browser_session_action_required", "Agent Browser action input was not normalized.");
+  }
+  return actLiveBrowserSession(live, row, state, input.action, env, request, auth, capability);
+}
+
+async function executeLiveBrowserSessionAuthToolCall(
+  live: RequiredLiveBindings,
+  capability: CapabilityName,
+  input: BrowserSessionToolInput,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  viewMode: BrowserSessionLiveViewMode = "tab"
+): Promise<Record<string, unknown>> {
+  const sessionId = input.sessionId;
+  if (!sessionId) {
+    throw new HostedError(400, "input.session_id_required", "Agent Browser session id is required.");
+  }
+  const row = await readBrowserSessionJobRow(live.DB, sessionId, auth);
+  assertOpenBrowserSessionRow(row);
+  const state = browserSessionStateFromRow(row);
+  if (capability === "browser.session_auth_request") {
+    return requestLiveBrowserSessionAuth(live, row, state, env, request, auth, viewMode);
+  }
+  if (capability === "browser.session_auth_status") {
+    return publicBrowserSessionAuthResult(capability, state, env);
+  }
+  if (capability === "browser.session_auth_complete") {
+    return completeLiveBrowserSessionAuth(live, row, state, env, request, auth, "cli");
+  }
+  if (capability === "browser.session_auth_revoke") {
+    return revokeLiveBrowserSessionAuth(live, row, state, env, request, auth, "cli");
+  }
+  throw new HostedError(400, "input.invalid_browser_session_auth_action", "Unsupported Agent Browser live-control action.");
+}
+
+async function openLiveBrowserSession(
+  live: RequiredLiveBindings,
+  input: BrowserSessionToolInput,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext
+): Promise<Record<string, unknown>> {
+  if (!input.url || !input.timeoutMs || !input.idleTimeoutMs) {
+    throw new HostedError(400, "input.invalid_browser_session", "Agent Browser session open input was not normalized.");
+  }
+  await assertBrowserNetworkTarget(input.url);
+  await ensureCostBearingCapabilityEnabled(env, request, auth, "browser.session_open");
+  const plan = activePlanForAuth(auth, env);
+  await enforceQuota(live.DB, auth, env, "browser.session_open", input);
+  const openedAt = nowIso();
+  const jobId = `job_${crypto.randomUUID()}`;
+  const retention = await readRetentionPolicy(live.DB, auth, env);
+  const retentionDays = Number(retention.artifactsDays ?? plan.limits.artifactRetentionDays);
+  const queue: QueueFairnessState = { globalQueuedAhead: 0, actorQueuedAhead: 0, fairDelaySeconds: 0 };
+  const job: ToolJobMessage = {
+    id: jobId,
+    capability: "browser.session_open",
+    input,
+    enqueuedAt: openedAt,
+    actorId: auth.actorId,
+    planName: plan.name,
+    retentionDays,
+    reservedCredits: 1,
+    reservedBrowserSeconds: Math.ceil(input.timeoutMs / 1000),
+    reservedSandboxSeconds: 0
+  };
+  const inserted = await insertRunningBrowserSessionWithQuotaReservation(live.DB, {
+    id: job.id,
+    actorId: job.actorId,
+    planName: job.planName,
+    capability: job.capability,
+    input,
+    createdAt: openedAt,
+    updatedAt: openedAt,
+    reservedCredits: job.reservedCredits,
+    reservedBrowserSeconds: job.reservedBrowserSeconds,
+    reservedSandboxSeconds: 0,
+    queue
+  }, plan);
+  if (!inserted) {
+    await recordAudit(env, "tools.browser_session.reservation_failed", "browser.session_open", request, auth, jobId);
+    throw new HostedError(429, "quota.reservation_conflict", "Another hosted run claimed Agent Browser capacity at the same moment. Retry in a few seconds, or close an existing session.");
+  }
+
+  const browser = await launchBrowserSession(live, input.idleTimeoutMs);
+  let shouldClose = true;
+  try {
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(Math.min(input.timeoutMs, input.idleTimeoutMs));
+    await installBrowserRequestPolicy(page);
+    await page.goto(input.url, { waitUntil: BROWSER_NAVIGATION_WAIT_UNTIL, timeout: Math.min(input.timeoutMs, input.idleTimeoutMs) });
+    await assertBrowserNetworkTarget(page.url());
+    const providerSessionId = browser.sessionId?.();
+    if (!providerSessionId) {
+      throw new HostedError(502, "provider.browser_session_missing_id", "Cloudflare Browser Run did not return a browser session id.");
+    }
+    const observation = await captureBrowserSessionObservation(live, env, job, page);
+    const state: BrowserSessionStoredState = {
+      sessionId: jobId,
+      providerSessionId,
+      requestedUrl: input.url,
+      currentUrl: observation.url,
+      title: observation.title,
+      status: "running",
+      createdAt: openedAt,
+      updatedAt: observation.observedAt,
+      expiresAt: addMillisecondsIso(observation.observedAt, input.idleTimeoutMs),
+      timeoutMs: input.timeoutMs,
+      idleTimeoutMs: input.idleTimeoutMs,
+      actionCount: 0,
+      observationCount: 1,
+      lastArtifactId: artifactIdFromObservation(observation)
+    };
+    await writeBrowserSessionState(live.DB, jobId, auth.actorId, state);
+    await disconnectBrowserSession(browser);
+    shouldClose = false;
+    await recordAudit(env, "tools.browser_session.opened", "browser.session_open", request, auth, jobId);
+    return publicBrowserSessionResult("browser.session_open", state, observation, undefined);
+  } catch (error) {
+    await markBrowserSessionFailed(live.DB, job, error);
+    throw error;
+  } finally {
+    if (shouldClose) {
+      await browser.close().catch(() => undefined);
+    }
+  }
+}
+
+async function observeLiveBrowserSession(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext
+): Promise<Record<string, unknown>> {
+  assertBrowserSessionAgentControlAllowed(state, "observe");
+  const job = browserSessionJobFromRow(row);
+  const browser = await connectBrowserSession(live, state);
+  try {
+    const page = await browserSessionPage(browser);
+    await installBrowserRequestPolicy(page);
+    const observation = await captureBrowserSessionObservation(live, env, job, page);
+    const updated = updateBrowserSessionState(state, observation, undefined);
+    await writeBrowserSessionState(live.DB, job.id, job.actorId, updated);
+    await recordAudit(env, "tools.browser_session.observed", "browser.session_observe", request, auth, job.id);
+    return publicBrowserSessionResult("browser.session_observe", updated, observation, undefined);
+  } catch (error) {
+    await markBrowserSessionUnavailableIfNeeded(live.DB, job, error);
+    throw error;
+  } finally {
+    await disconnectBrowserSession(browser).catch(() => undefined);
+  }
+}
+
+async function actLiveBrowserSession(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  action: BrowserAgentAction,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  capability: CapabilityName
+): Promise<Record<string, unknown>> {
+  assertBrowserSessionAgentControlAllowed(state, action.action);
+  const job = browserSessionJobFromRow(row);
+  const browser = await connectBrowserSession(live, state);
+  try {
+    const page = await browserSessionPage(browser);
+    await installBrowserRequestPolicy(page);
+    const performed = await performBrowserAgentAction(page, action, Math.min(30_000, state.idleTimeoutMs));
+    const observation = await captureBrowserSessionObservation(live, env, job, page);
+    const updated = updateBrowserSessionState(state, observation, performed);
+    await writeBrowserSessionState(live.DB, job.id, job.actorId, updated);
+    await recordAudit(env, `tools.browser_session.${action.action}`, capability, request, auth, job.id);
+    return publicBrowserSessionResult(capability, updated, observation, performed);
+  } catch (error) {
+    await markBrowserSessionUnavailableIfNeeded(live.DB, job, error);
+    throw error;
+  } finally {
+    await disconnectBrowserSession(browser).catch(() => undefined);
+  }
+}
+
+async function closeLiveBrowserSession(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext
+): Promise<Record<string, unknown>> {
+  const job = browserSessionJobFromRow(row);
+  let observation: BrowserSessionObservation | undefined;
+  let artifactForUsage: StoredArtifactResult | undefined;
+  let closeReason = "closed";
+  const browser = await connectBrowserSession(live, state).catch(async (error) => {
+    closeReason = "provider_unavailable";
+    await markBrowserSessionUnavailableIfNeeded(live.DB, job, error);
+    return undefined;
+  });
+  if (browser) {
+    try {
+      const page = await browserSessionPage(browser);
+      await installBrowserRequestPolicy(page);
+      observation = await captureBrowserSessionObservation(live, env, job, page);
+      artifactForUsage = artifactFromObservation(observation);
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+  }
+  const closedAt = nowIso();
+  const completedState: BrowserSessionStoredState = {
+    ...state,
+    status: "completed",
+    closeReason,
+    updatedAt: closedAt,
+    expiresAt: closedAt,
+    ...(observation ? {
+      currentUrl: observation.url,
+      title: observation.title,
+      observationCount: state.observationCount + 1,
+      lastArtifactId: artifactIdFromObservation(observation)
+    } : {})
+  };
+  await live.DB.prepare(
+    "UPDATE jobs SET status = 'completed', result_json = ?, completed_at = ?, updated_at = ? WHERE id = ? AND actor_id = ? AND status IN ('running', 'queued')"
+  ).bind(JSON.stringify(redactObject(completedState)), closedAt, closedAt, job.id, job.actorId).run();
+  await writeUsage(live.DB, job, artifactForUsage ?? {
+    id: "",
+    kind: "browser-session",
+    contentType: "application/json",
+    bytes: 0,
+    browserMsUsed: Math.max(1, Date.parse(closedAt) - Date.parse(state.createdAt))
+  }, state.createdAt, closedAt);
+  await recordAudit(env, "tools.browser_session.closed", "browser.session_close", request, auth, job.id);
+  return publicBrowserSessionResult("browser.session_close", completedState, observation, { action: "close", ok: true, closeReason });
+}
+
+async function requestLiveBrowserSessionAuth(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  viewMode: BrowserSessionLiveViewMode = "tab"
+): Promise<Record<string, unknown>> {
+  return requestLiveBrowserSessionLink(live, row, state, env, request, auth, {
+    enterHumanControl: true,
+    event: "tools.browser_session.auth_requested",
+    viewMode
+  });
+}
+
+async function requestLiveBrowserSessionView(
+  live: RequiredLiveBindings,
+  input: BrowserSessionToolInput,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  viewMode: BrowserSessionLiveViewMode = "tab"
+): Promise<Record<string, unknown>> {
+  const sessionId = input.sessionId;
+  if (!sessionId) {
+    throw new HostedError(400, "input.session_id_required", "Agent Browser session id is required.");
+  }
+  const row = await readBrowserSessionJobRow(live.DB, sessionId, auth);
+  assertOpenBrowserSessionRow(row);
+  const state = browserSessionStateFromRow(row);
+  return requestLiveBrowserSessionLink(live, row, state, env, request, auth, {
+    enterHumanControl: false,
+    event: "tools.browser_session.live_requested",
+    viewMode
+  });
+}
+
+async function requestLiveBrowserSessionLink(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  options: { enterHumanControl: boolean; event: string; viewMode?: BrowserSessionLiveViewMode }
+): Promise<Record<string, unknown>> {
+  ensureBrowserSessionHandoffConfigured(env);
+  const requestedAt = nowIso();
+  const token = browserSessionHandoffToken();
+  const tokenHash = await browserSessionHandoffTokenHash(token);
+  const tokenExpiresAt = minIso(addMillisecondsIso(requestedAt, BROWSER_SESSION_HANDOFF_TTL_MS), state.expiresAt);
+  const updated: BrowserSessionStoredState = {
+    ...state,
+    authState: options.enterHumanControl ? "human_control" : state.authState,
+    handoffRequestedAt: requestedAt,
+    handoffUpdatedAt: requestedAt,
+    handoffTokenHash: tokenHash,
+    handoffTokenExpiresAt: tokenExpiresAt,
+    handoffCompletedAt: undefined,
+    handoffRevokedAt: undefined,
+    updatedAt: requestedAt
+  };
+  await writeBrowserSessionState(live.DB, row.id, row.actor_id, updated);
+  await recordAudit(env, options.event, "browser.session_auth_request", request, auth, row.id);
+  return publicBrowserSessionAuthResult("browser.session_auth_request", updated, env, {
+    handoffUrl: browserSessionHandoffUrl(env, row.id, token, options.viewMode ?? "tab"),
+    handoffExpiresAt: tokenExpiresAt,
+    controlMode: options.enterHumanControl ? "human_control" : "watch",
+    viewMode: options.viewMode ?? "tab"
+  });
+}
+
+async function takeControlLiveBrowserSession(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  source: "cli" | "handoff"
+): Promise<Record<string, unknown>> {
+  const updatedAt = nowIso();
+  const updated: BrowserSessionStoredState = {
+    ...state,
+    authState: "human_control",
+    handoffUpdatedAt: updatedAt,
+    handoffCompletedAt: undefined,
+    handoffRevokedAt: undefined,
+    updatedAt
+  };
+  await writeBrowserSessionState(live.DB, row.id, row.actor_id, updated);
+  await recordAudit(env, "tools.browser_session.control_taken", "browser.session_auth_request", request, auth, row.id);
+  return publicBrowserSessionAuthResult("browser.session_auth_request", updated, env, { source });
+}
+
+async function completeLiveBrowserSessionAuth(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  source: "cli" | "handoff"
+): Promise<Record<string, unknown>> {
+  const completedAt = nowIso();
+  const updated = browserSessionAuthStateUpdate(state, "auth_ready", completedAt, {
+    keepHandoffToken: source === "handoff"
+  });
+  await writeBrowserSessionState(live.DB, row.id, row.actor_id, updated);
+  await recordAudit(env, "tools.browser_session.auth_completed", "browser.session_auth_complete", request, auth, row.id);
+  return publicBrowserSessionAuthResult("browser.session_auth_complete", updated, env, { source });
+}
+
+async function revokeLiveBrowserSessionAuth(
+  live: RequiredLiveBindings,
+  row: JobRow,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  request: Request,
+  auth: AuthContext,
+  source: "cli" | "handoff"
+): Promise<Record<string, unknown>> {
+  const revokedAt = nowIso();
+  const updated = browserSessionAuthStateUpdate(state, "revoked", revokedAt);
+  await writeBrowserSessionState(live.DB, row.id, row.actor_id, updated);
+  await recordAudit(env, "tools.browser_session.auth_revoked", "browser.session_auth_revoke", request, auth, row.id);
+  return publicBrowserSessionAuthResult("browser.session_auth_revoke", updated, env, { source });
+}
+
+function browserSessionAuthStateUpdate(
+  state: BrowserSessionStoredState,
+  authState: "auth_ready" | "revoked",
+  updatedAt: string,
+  options: { keepHandoffToken?: boolean } = {}
+): BrowserSessionStoredState {
+  return {
+    ...state,
+    authState,
+    handoffUpdatedAt: updatedAt,
+    handoffTokenHash: options.keepHandoffToken ? state.handoffTokenHash : undefined,
+    handoffTokenExpiresAt: options.keepHandoffToken ? state.handoffTokenExpiresAt : undefined,
+    ...(authState === "auth_ready" ? { handoffCompletedAt: updatedAt, handoffRevokedAt: undefined } : { handoffRevokedAt: updatedAt }),
+    updatedAt
+  };
+}
+
+async function launchBrowserSession(live: RequiredLiveBindings, idleTimeoutMs: number): Promise<BrowserSessionBrowser> {
+  return await puppeteer.launch(live.BROWSER, {
+    keep_alive: browserSessionKeepAliveMs(idleTimeoutMs)
+  }) as unknown as BrowserSessionBrowser;
+}
+
+async function connectBrowserSession(live: RequiredLiveBindings, state: BrowserSessionStoredState): Promise<BrowserSessionBrowser> {
+  const api = puppeteer as unknown as {
+    connect(binding: BrowserWorker, sessionId: string): Promise<BrowserSessionBrowser>;
+  };
+  if (typeof api.connect !== "function") {
+    throw new HostedError(502, "provider.browser_session_connect_unavailable", "Cloudflare Browser Run session reconnect is not available in this runtime.");
+  }
+  return await api.connect(live.BROWSER, state.providerSessionId);
+}
+
+async function browserSessionPage(browser: BrowserSessionBrowser): Promise<BrowserSessionPage> {
+  const pages = browser.pages ? await browser.pages() : [];
+  return pages[0] ?? await browser.newPage();
+}
+
+async function disconnectBrowserSession(browser: BrowserSessionBrowser): Promise<void> {
+  if (browser.disconnect) {
+    await browser.disconnect();
+    return;
+  }
+  await browser.close();
+}
+
+async function captureBrowserSessionObservation(
+  live: RequiredLiveBindings,
+  env: HostedEnv,
+  job: ToolJobMessage,
+  page: BrowserSessionPage
+): Promise<BrowserSessionObservation> {
+  const snapshot = await captureBrowserAgentSnapshot(page);
+  const screenshot = await page.screenshot({ type: "png", fullPage: true });
+  const artifact = await storeJobArtifact(live, job, "browser-session-screenshot-png", "image/png", bytesFromScreenshot(screenshot));
+  const observedAt = nowIso();
+  const links = Array.isArray(snapshot.links)
+    ? snapshot.links.filter(isRecord).slice(0, 50).map((link) => ({
+      text: typeof link.text === "string" ? link.text.slice(0, 160) : "",
+      href: typeof link.href === "string" ? link.href : ""
+    }))
+    : [];
+  return {
+    observedAt,
+    url: typeof snapshot.finalUrl === "string" ? snapshot.finalUrl : page.url(),
+    title: typeof snapshot.title === "string" ? snapshot.title : null,
+    text: typeof snapshot.text === "string" ? snapshot.text.slice(0, 12_000) : "",
+    links,
+    screenshot: artifactPublic(artifact, env)
+  };
+}
+
+function bytesFromScreenshot(value: Uint8Array | ArrayBuffer): Uint8Array {
+  return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
+
+function artifactPublic(artifact: StoredArtifactResult, env: HostedEnv): Record<string, unknown> {
+  return {
+    id: artifact.id,
+    kind: artifact.kind,
+    contentType: artifact.contentType,
+    bytes: artifact.bytes,
+    downloadUrl: `${publicBase(env)}/v1/artifacts/${encodeURIComponent(artifact.id)}/download`
+  };
+}
+
+function artifactIdFromObservation(observation: BrowserSessionObservation): string | undefined {
+  return typeof observation.screenshot.id === "string" ? observation.screenshot.id : undefined;
+}
+
+function artifactFromObservation(observation: BrowserSessionObservation): StoredArtifactResult | undefined {
+  const id = typeof observation.screenshot.id === "string" ? observation.screenshot.id : undefined;
+  if (!id) {
+    return undefined;
+  }
+  return {
+    id,
+    kind: typeof observation.screenshot.kind === "string" ? observation.screenshot.kind : "browser-session-screenshot-png",
+    contentType: typeof observation.screenshot.contentType === "string" ? observation.screenshot.contentType : "image/png",
+    bytes: typeof observation.screenshot.bytes === "number" ? observation.screenshot.bytes : 0
+  };
+}
+
+async function readBrowserSessionJobRow(db: D1Database, sessionId: string, auth: AuthContext): Promise<JobRow> {
+  const row = await db.prepare(
+    "SELECT id, actor_id, plan_name, capability, status, input_json, result_json, error_code, error_message, provider_mode, queue_global_ahead, queue_actor_ahead, queue_delay_seconds, created_at, updated_at, started_at, completed_at, canceled_at FROM jobs WHERE id = ? AND actor_id = ? AND capability = 'browser.session_open'"
+  ).bind(sessionId, auth.actorId).first<JobRow>();
+  if (!row) {
+    throw new HostedError(404, "browser_session.not_found", "Agent Browser session was not found for this account.");
+  }
+  return row;
+}
+
+function assertOpenBrowserSessionRow(row: JobRow): void {
+  if (row.status !== "running") {
+    throw new HostedError(409, "browser_session.not_open", `Agent Browser session is ${row.status}.`);
+  }
+}
+
+function browserSessionStateFromRow(row: JobRow): BrowserSessionStoredState {
+  const result = safeJson(row.result_json);
+  if (!isRecord(result) || typeof result.providerSessionId !== "string") {
+    throw new HostedError(409, "browser_session.not_ready", "Agent Browser session is not ready yet.");
+  }
+  const authState = normalizeBrowserSessionAuthState(result.authState);
+  return {
+    sessionId: typeof result.sessionId === "string" ? result.sessionId : row.id,
+    providerSessionId: result.providerSessionId,
+    requestedUrl: typeof result.requestedUrl === "string" ? result.requestedUrl : "",
+    currentUrl: typeof result.currentUrl === "string" ? result.currentUrl : "",
+    title: typeof result.title === "string" ? result.title : null,
+    status: result.status === "completed" || result.status === "failed" ? result.status : "running",
+    ...(authState ? { authState } : {}),
+    ...(typeof result.handoffRequestedAt === "string" ? { handoffRequestedAt: result.handoffRequestedAt } : {}),
+    ...(typeof result.handoffUpdatedAt === "string" ? { handoffUpdatedAt: result.handoffUpdatedAt } : {}),
+    ...(typeof result.handoffTokenHash === "string" ? { handoffTokenHash: result.handoffTokenHash } : {}),
+    ...(typeof result.handoffTokenExpiresAt === "string" ? { handoffTokenExpiresAt: result.handoffTokenExpiresAt } : {}),
+    ...(typeof result.handoffCompletedAt === "string" ? { handoffCompletedAt: result.handoffCompletedAt } : {}),
+    ...(typeof result.handoffRevokedAt === "string" ? { handoffRevokedAt: result.handoffRevokedAt } : {}),
+    createdAt: typeof result.createdAt === "string" ? result.createdAt : row.created_at,
+    updatedAt: typeof result.updatedAt === "string" ? result.updatedAt : row.updated_at,
+    expiresAt: typeof result.expiresAt === "string" ? result.expiresAt : row.updated_at,
+    timeoutMs: typeof result.timeoutMs === "number" ? result.timeoutMs : DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS,
+    idleTimeoutMs: typeof result.idleTimeoutMs === "number" ? result.idleTimeoutMs : DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS,
+    actionCount: typeof result.actionCount === "number" ? result.actionCount : 0,
+    observationCount: typeof result.observationCount === "number" ? result.observationCount : 0,
+    ...(typeof result.lastArtifactId === "string" ? { lastArtifactId: result.lastArtifactId } : {}),
+    ...(typeof result.closeReason === "string" ? { closeReason: result.closeReason } : {})
+  };
+}
+
+function normalizeBrowserSessionAuthState(value: unknown): BrowserSessionAuthState | undefined {
+  return value === "public" || value === "human_control" || value === "auth_ready" || value === "revoked" ? value : undefined;
+}
+
+function browserSessionJobFromRow(row: JobRow): ToolJobMessage {
+  const input = safeJson(row.input_json);
+  return {
+    id: row.id,
+    capability: "browser.session_open",
+    input: browserSessionInputFromStored(input, row.id),
+    enqueuedAt: row.created_at,
+    actorId: row.actor_id,
+    planName: row.plan_name,
+    retentionDays: planByName(row.plan_name).limits.artifactRetentionDays || 1,
+    reservedCredits: 1,
+    reservedBrowserSeconds: 0,
+    reservedSandboxSeconds: 0
+  };
+}
+
+function browserSessionInputFromStored(input: unknown, fallbackSessionId: string): BrowserSessionToolInput {
+  if (!isRecord(input) || input.kind !== "browser-session") {
+    return { kind: "browser-session", sessionId: fallbackSessionId };
+  }
+  return {
+    kind: "browser-session",
+    ...(typeof input.sessionId === "string" ? { sessionId: input.sessionId } : {}),
+    ...(typeof input.url === "string" ? { url: input.url } : {}),
+    ...(typeof input.timeoutMs === "number" ? { timeoutMs: input.timeoutMs } : {}),
+    ...(typeof input.idleTimeoutMs === "number" ? { idleTimeoutMs: input.idleTimeoutMs } : {})
+  };
+}
+
+function updateBrowserSessionState(
+  state: BrowserSessionStoredState,
+  observation: BrowserSessionObservation,
+  action: Record<string, unknown> | undefined
+): BrowserSessionStoredState {
+  return {
+    ...state,
+    currentUrl: observation.url,
+    title: observation.title,
+    updatedAt: observation.observedAt,
+    expiresAt: addMillisecondsIso(observation.observedAt, state.idleTimeoutMs),
+    observationCount: state.observationCount + 1,
+    actionCount: action ? state.actionCount + 1 : state.actionCount,
+    lastArtifactId: artifactIdFromObservation(observation)
+  };
+}
+
+async function writeBrowserSessionState(db: D1Database, sessionId: string, actorId: string, state: BrowserSessionStoredState): Promise<void> {
+  await db.prepare("UPDATE jobs SET result_json = ?, updated_at = ? WHERE id = ? AND actor_id = ? AND status = 'running'")
+    .bind(JSON.stringify(state), state.updatedAt, sessionId, actorId)
+    .run();
+}
+
+async function markBrowserSessionFailed(db: D1Database, job: ToolJobMessage, error: unknown): Promise<void> {
+  const failedAt = nowIso();
+  const code = error instanceof HostedError ? error.code : "provider.browser_session_failed";
+  const message = error instanceof Error ? sanitizeErrorMessage(error.message) : "Agent Browser session failed.";
+  await db.prepare(
+    "UPDATE jobs SET status = 'failed', error_code = ?, error_message = ?, completed_at = ?, updated_at = ? WHERE id = ? AND actor_id = ? AND status IN ('queued', 'running')"
+  ).bind(code, message, failedAt, failedAt, job.id, job.actorId).run();
+}
+
+async function markBrowserSessionUnavailableIfNeeded(db: D1Database, job: ToolJobMessage, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (!/session|browser|target|websocket|closed|connect/i.test(message)) {
+    return;
+  }
+  await markBrowserSessionFailed(db, job, error);
+}
+
+function publicBrowserSessionResult(
+  capability: CapabilityName,
+  state: BrowserSessionStoredState,
+  observation: BrowserSessionObservation | undefined,
+  action: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  return {
+    id: state.sessionId,
+    session: {
+      id: state.sessionId,
+      status: state.status,
+      url: state.currentUrl,
+      title: state.title,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      expiresAt: state.expiresAt,
+      idleTimeoutMs: state.idleTimeoutMs,
+      timeoutMs: state.timeoutMs,
+      actionCount: state.actionCount,
+      observationCount: state.observationCount,
+      auth: browserSessionAuthPublic(state),
+      ...(state.closeReason ? { closeReason: state.closeReason } : {})
+    },
+    status: state.status === "running" ? "observed" : state.status,
+    capability,
+    providerMode: "live",
+    quotaChecked: true,
+    auditLogged: true,
+    ...(action ? { action } : {}),
+    ...(observation ? { observation } : {}),
+    commands: {
+      observe: `vibecodr browser session observe ${state.sessionId}`,
+      close: `vibecodr browser session close ${state.sessionId}`,
+      auth: `vibecodr browser session auth ${state.sessionId}`,
+      authStatus: `vibecodr browser session auth-status ${state.sessionId}`,
+      authComplete: `vibecodr browser session auth-complete ${state.sessionId}`,
+      authRevoke: `vibecodr browser session auth-revoke ${state.sessionId}`,
+      click: `vibecodr browser session click ${state.sessionId} --selector <css>`,
+      type: `vibecodr browser session type ${state.sessionId} --selector <css> --text <text>`
+    }
+  };
+}
+
+function publicBrowserSessionAuthResult(
+  capability: CapabilityName,
+  state: BrowserSessionStoredState,
+  env: HostedEnv,
+  extra: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const auth = browserSessionAuthPublic(state, extra);
+  return {
+    id: state.sessionId,
+    session: {
+      id: state.sessionId,
+      status: state.status,
+      url: state.currentUrl,
+      title: state.title,
+      updatedAt: state.updatedAt,
+      expiresAt: state.expiresAt,
+      auth
+    },
+    status: auth.status,
+    capability,
+    providerMode: providerMode(env),
+    quotaChecked: true,
+    auditLogged: true,
+    auth,
+    commands: {
+      openHandoff: typeof extra.handoffUrl === "string" ? extra.handoffUrl : undefined,
+      live: `vibecodr browser session live ${state.sessionId}`,
+      status: `vibecodr browser session auth-status ${state.sessionId}`,
+      complete: `vibecodr browser session auth-complete ${state.sessionId}`,
+      revoke: `vibecodr browser session auth-revoke ${state.sessionId}`,
+      close: `vibecodr browser session close ${state.sessionId}`
+    }
+  };
+}
+
+function browserSessionAuthPublic(state: BrowserSessionStoredState, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  const status = effectiveBrowserSessionAuthStatus(state);
+  return {
+    status,
+    requestedAt: state.handoffRequestedAt,
+    updatedAt: state.handoffUpdatedAt,
+    expiresAt: state.handoffTokenExpiresAt,
+    completedAt: state.handoffCompletedAt,
+    revokedAt: state.handoffRevokedAt,
+    message: browserSessionAuthMessage(status),
+    ...extra
+  };
+}
+
+function effectiveBrowserSessionAuthStatus(state: BrowserSessionStoredState): BrowserSessionAuthState | "handoff_expired" {
+  if ((state.authState ?? "public") === "human_control" && isExpiredIso(state.handoffTokenExpiresAt)) {
+    return "handoff_expired";
+  }
+  return state.authState ?? "public";
+}
+
+function browserSessionAuthMessage(status: BrowserSessionAuthState | "handoff_expired"): string {
+  if (status === "human_control") {
+    return "You are controlling the browser. The agent waits until you give it back.";
+  }
+  if (status === "auth_ready") {
+    return "The agent can continue in this browser. You can keep watching or take over again.";
+  }
+  if (status === "revoked") {
+    return "This live link ended. Ask the agent for a fresh link if you need to watch again.";
+  }
+  if (status === "handoff_expired") {
+    return "This watch link expired. Ask the agent for a fresh live link.";
+  }
+  return "The agent is browsing. You can watch, take over, or end the browser.";
+}
+
+function assertBrowserSessionAgentControlAllowed(state: BrowserSessionStoredState, action: string): void {
+  const status = effectiveBrowserSessionAuthStatus(state);
+  if (status === "human_control") {
+    throw new HostedError(409, "browser_session.human_control", `Agent Browser ${action} is paused while human control is active.`);
+  }
+  if (status === "handoff_expired") {
+    throw new HostedError(409, "browser_session.auth_handoff_expired", "Agent Browser live control expired before the human gave control back. Request a fresh link or revoke it.");
+  }
+  if (status === "revoked") {
+    throw new HostedError(409, "browser_session.auth_revoked", "Agent Browser live control was revoked. Close this session or open a new public session.");
+  }
 }
 
 function ensureScheduledQaIncluded(plan: Plan): void {
@@ -2393,16 +3885,59 @@ async function executeBrowserSessionJob(job: ToolJobMessage, live: RequiredLiveB
       return storeJobArtifact(live, job, "pdf", "application/pdf", pdf);
     }
 
-    const extracted = await page.evaluate(() => {
+    const extracted = await page.evaluate(({ rootSelectors, minRootTextChars }) => {
+      type ReadableElement = {
+        innerText?: string | undefined;
+        textContent?: string | null | undefined;
+        href?: string | undefined;
+        querySelectorAll(selector: string): Iterable<ReadableElement>;
+        remove?(): void;
+        cloneNode?(deep?: boolean): ReadableElement;
+      };
       const browserGlobal = globalThis as unknown as {
         document: {
           title: string;
-          body?: { innerText?: string };
-          querySelectorAll(selector: string): Iterable<{ textContent?: string | null; href?: string }>;
+          body?: ReadableElement;
+          querySelector(selector: string): ReadableElement | null;
         };
         location: { href: string };
       };
-      const anchors = Array.from(browserGlobal.document.querySelectorAll("a[href]"))
+      const normalizeText = (value: string | undefined | null) => (value ?? "").replace(/\n{3,}/g, "\n\n").trim();
+      const removableSelectors = [
+        "script",
+        "style",
+        "noscript",
+        "template",
+        "nav",
+        "aside",
+        "header",
+        "footer",
+        "[role='navigation']",
+        "[aria-label*='breadcrumb' i]",
+        "[class*='sidebar' i]",
+        "[class*='toc' i]",
+        "[data-testid*='sidebar' i]"
+      ];
+      const rootCandidates = (rootSelectors as readonly string[])
+        .map((selector) => {
+          const element = browserGlobal.document.querySelector(selector);
+          if (!element) return undefined;
+          const text = normalizeText(element.innerText ?? element.textContent);
+          return text.length >= minRootTextChars ? { element, selector, text } : undefined;
+        })
+        .filter((candidate): candidate is { element: ReadableElement; selector: string; text: string } => candidate !== undefined);
+      const firstRoot = rootCandidates[0];
+      const fallback = browserGlobal.document.body?.cloneNode?.(true);
+      if (!firstRoot && fallback) {
+        for (const selector of removableSelectors) {
+          for (const element of Array.from(fallback.querySelectorAll(selector))) {
+            element.remove?.();
+          }
+        }
+      }
+      const root = firstRoot?.element ?? fallback ?? browserGlobal.document.body;
+      const text = firstRoot?.text ?? normalizeText(root?.innerText ?? root?.textContent);
+      const anchors = Array.from(root?.querySelectorAll("a[href]") ?? [])
         .slice(0, 100)
         .map((anchor) => ({
           text: (anchor.textContent ?? "").replace(/\s+/g, " ").trim(),
@@ -2411,10 +3946,11 @@ async function executeBrowserSessionJob(job: ToolJobMessage, live: RequiredLiveB
       return {
         title: browserGlobal.document.title,
         finalUrl: browserGlobal.location.href,
-        text: (browserGlobal.document.body?.innerText ?? "").replace(/\n{3,}/g, "\n\n").trim().slice(0, 200_000),
+        text: text.slice(0, 200_000),
+        rootSelector: firstRoot?.selector ?? "body",
         links: anchors
       };
-    });
+    }, { rootSelectors: [...BROWSER_READ_ROOT_SELECTORS], minRootTextChars: BROWSER_READ_MIN_ROOT_TEXT_CHARS });
 
     if (job.capability === "browser.extract_markdown") {
       const markdown = browserMarkdown(extracted);
@@ -2657,6 +4193,19 @@ async function executeBrowserQuickActionJob(
     ), response);
   }
 
+  if (job.capability === "browser.extract_markdown") {
+    const mainContent = await browserReadMarkdownFromMainContent(config, job.input.url, job.input.timeoutMs);
+    if (mainContent) {
+      return withBrowserMsUsed(await storeJobArtifact(
+        live,
+        job,
+        "markdown",
+        "text/markdown; charset=utf-8",
+        mainContent.markdown
+      ), mainContent.browserMsUsed);
+    }
+  }
+
   const endpoint = job.capability === "browser.extract_markdown" ? "markdown" : "content";
   const response = await callBrowserQuickAction(config, endpoint, {
     url: job.input.url,
@@ -2670,6 +4219,67 @@ async function executeBrowserQuickActionJob(
     endpoint === "markdown" ? "text/markdown; charset=utf-8" : "text/html; charset=utf-8",
     text
   ), response);
+}
+
+async function browserReadMarkdownFromMainContent(
+  config: BrowserQuickActionConfig,
+  url: string,
+  timeoutMs: number
+): Promise<{ markdown: string; browserMsUsed?: number } | undefined> {
+  const scrapeResponse = await callBrowserQuickAction(config, "scrape", {
+    url,
+    gotoOptions: quickActionGotoOptions(timeoutMs),
+    elements: BROWSER_READ_ROOT_SELECTORS.map((selector) => ({ selector }))
+  });
+  const root = selectReadableScrapeRoot(await quickActionJsonResult(scrapeResponse, "provider.browser_scrape_invalid_response"));
+  if (!root) {
+    return undefined;
+  }
+
+  const html = root.html.trim()
+    ? `<main data-vibecodr-read-root="${escapeHtml(root.selector)}">${root.html}</main>`
+    : `<main data-vibecodr-read-root="${escapeHtml(root.selector)}"><p>${escapeHtml(root.text)}</p></main>`;
+  const markdownResponse = await callBrowserQuickAction(config, "markdown", { html });
+  const body = normalizeMarkdownBody(await quickActionResultText(markdownResponse));
+  if (body.length < BROWSER_READ_MIN_ROOT_TEXT_CHARS / 2) {
+    return undefined;
+  }
+
+  const browserMsUsed = sumBrowserMsUsed(scrapeResponse, markdownResponse);
+  return {
+    markdown: [`Source: ${url}`, body].join("\n\n"),
+    ...(browserMsUsed === undefined ? {} : { browserMsUsed })
+  };
+}
+
+function selectReadableScrapeRoot(result: unknown): { selector: string; html: string; text: string } | undefined {
+  if (!Array.isArray(result)) {
+    return undefined;
+  }
+  for (const selectorResult of result) {
+    if (!isRecord(selectorResult) || typeof selectorResult.selector !== "string" || !Array.isArray(selectorResult.results)) {
+      continue;
+    }
+    for (const item of selectorResult.results) {
+      if (!isRecord(item)) {
+        continue;
+      }
+      const text = typeof item.text === "string" ? item.text.replace(/\n{3,}/g, "\n\n").trim() : "";
+      if (text.length < BROWSER_READ_MIN_ROOT_TEXT_CHARS) {
+        continue;
+      }
+      return {
+        selector: selectorResult.selector,
+        html: typeof item.html === "string" ? item.html : "",
+        text
+      };
+    }
+  }
+  return undefined;
+}
+
+function normalizeMarkdownBody(markdown: string): string {
+  return markdown.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 async function executeBrowserQuickActionCrawlJob(
@@ -2763,12 +4373,16 @@ async function quickActionResultText(response: Response): Promise<string> {
 }
 
 async function quickActionStringResult(response: Response, invalidCode: string): Promise<string> {
+  const result = await quickActionJsonResult(response, invalidCode);
+  return typeof result === "string" ? result : JSON.stringify(result ?? "", null, 2);
+}
+
+async function quickActionJsonResult(response: Response, invalidCode: string): Promise<unknown> {
   const payload = await response.json().catch(() => undefined);
   if (!isRecord(payload) || payload.success !== true) {
     throw new HostedError(502, invalidCode, "Browser Run Quick Action returned an invalid response.");
   }
-  const result = payload.result;
-  return typeof result === "string" ? result : JSON.stringify(result ?? "", null, 2);
+  return payload.result;
 }
 
 async function waitForBrowserCrawlResult(
@@ -2923,10 +4537,22 @@ function isRetryableProviderError(error: unknown): boolean {
   return error instanceof HostedError && error.code === "provider.browser_run_rate_limited";
 }
 
-function withBrowserMsUsed(artifact: StoredArtifactResult, response: Response): StoredArtifactResult {
+function browserMsUsedFromResponse(response: Response): number | undefined {
   const raw = response.headers.get("x-browser-ms-used");
   const browserMsUsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(browserMsUsed) && browserMsUsed > 0 ? { ...artifact, browserMsUsed } : artifact;
+  return Number.isFinite(browserMsUsed) && browserMsUsed > 0 ? browserMsUsed : undefined;
+}
+
+function sumBrowserMsUsed(...responses: Response[]): number | undefined {
+  const values = responses
+    .map((response) => browserMsUsedFromResponse(response))
+    .filter((value): value is number => value !== undefined);
+  return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) : undefined;
+}
+
+function withBrowserMsUsed(artifact: StoredArtifactResult, responseOrMs: Response | number | undefined): StoredArtifactResult {
+  const browserMsUsed = typeof responseOrMs === "number" ? responseOrMs : responseOrMs ? browserMsUsedFromResponse(responseOrMs) : undefined;
+  return browserMsUsed !== undefined ? { ...artifact, browserMsUsed } : artifact;
 }
 
 function browserQuickActionConfig(env: HostedEnv): BrowserQuickActionConfig | undefined {
@@ -2987,6 +4613,40 @@ function sandboxResultPayload(result: ExecResult): Record<string, unknown> {
 }
 
 function normalizeHostedToolInput(capability: CapabilityName, input: Record<string, unknown>): NormalizedToolInput {
+  if (BROWSER_SESSION_CONTROL_CAPABILITIES.has(capability)) {
+    assertNoBrowserAuthInput(input);
+    if (capability === "browser.session_open") {
+      const url = typeof input.url === "string" ? validateBrowserUrl(input.url) : "";
+      if (!url) {
+        throw new HostedError(400, "input.url_required", "browser.session_open requires an HTTPS URL target.");
+      }
+      return {
+        kind: "browser-session",
+        url,
+        timeoutMs: numberInRange(input.timeoutMs, 1000, MAX_BROWSER_AGENT_TASK_TIMEOUT_MS, DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS, "timeoutMs"),
+        idleTimeoutMs: numberInRange(input.idleTimeoutMs, 1000, DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS, DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS, "idleTimeoutMs")
+      };
+    }
+
+    const sessionId = normalizeBrowserSessionId(input.sessionId);
+    if (capability === "browser.session_observe" || capability === "browser.session_close") {
+      return { kind: "browser-session", sessionId };
+    }
+    return {
+      kind: "browser-session",
+      sessionId,
+      action: normalizeBrowserSessionAction(capability, input)
+    };
+  }
+
+  if (BROWSER_SESSION_AUTH_CAPABILITIES.has(capability)) {
+    assertNoBrowserAuthInput(input);
+    return {
+      kind: "browser-session",
+      sessionId: normalizeBrowserSessionId(input.sessionId)
+    };
+  }
+
   if (BROWSER_CAPABILITIES.has(capability)) {
     assertNoBrowserAuthInput(input);
     const url = typeof input.url === "string" ? validateBrowserUrl(input.url) : "";
@@ -3054,6 +4714,38 @@ function normalizeHostedToolInput(capability: CapabilityName, input: Record<stri
   return jobId ? { kind: "job", jobId } : { kind: "job" };
 }
 
+function normalizeBrowserSessionId(input: unknown): string {
+  const id = typeof input === "string" ? input.trim() : "";
+  if (!/^job_[A-Za-z0-9_-]{8,120}$/.test(id)) {
+    throw new HostedError(400, "input.invalid_session_id", "Agent Browser session id must be the job_ id returned by browser.session.open.");
+  }
+  return id;
+}
+
+function normalizeBrowserSessionAction(capability: CapabilityName, input: Record<string, unknown>): BrowserAgentAction {
+  if (capability === "browser.session_navigate") {
+    const url = typeof input.url === "string" ? validateBrowserUrl(input.url) : "";
+    if (!url) throw new HostedError(400, "input.url_required", "browser.session.goto requires an HTTPS URL target.");
+    return { action: "navigate", url };
+  }
+  if (capability === "browser.session_click") {
+    return { action: "click", selector: normalizeCssSelector(input.selector) };
+  }
+  if (capability === "browser.session_type") {
+    const selector = normalizeCssSelector(input.selector);
+    const text = typeof input.text === "string" ? input.text.slice(0, 2_000) : "";
+    if (!text) throw new HostedError(400, "input.text_required", "browser.session.type requires text.");
+    return { action: "type", selector, text };
+  }
+  if (capability === "browser.session_scroll") {
+    return { action: "scroll", deltaY: numberInRange(input.deltaY, -10_000, 10_000, 800, "deltaY") };
+  }
+  if (capability === "browser.session_wait") {
+    return { action: "wait", ms: numberInRange(input.ms, 1, 30_000, 1_000, "ms") };
+  }
+  throw new HostedError(400, "input.invalid_browser_session_action", "Unsupported Agent Browser session action.");
+}
+
 function assertNoBrowserAuthInput(input: Record<string, unknown>): void {
   const forbidden = [
     "headers",
@@ -3071,7 +4763,7 @@ function assertNoBrowserAuthInput(input: Record<string, unknown>): void {
     throw new HostedError(
       403,
       "policy.authenticated_browser_denied",
-      "Blocked for safety: browser calls cannot include cookies, credentials, auth headers, storage state, sessions, or secrets. Use a public page, or connect an authenticated browsing session when that beta is available.",
+      "Blocked for safety: browser calls cannot include cookies, credentials, auth headers, storage state, sessions, or secrets. Use `vibecodr browser session live <sessionId>` to watch or `vibecodr browser session auth <sessionId>` when a human needs control.",
       { fields: present }
     );
   }
@@ -3089,7 +4781,7 @@ function validateBrowserUrl(input: string): string {
     throw new HostedError(400, "input.invalid_url", "Blocked for safety: vc-tools can browse public HTTPS pages. Try a deployed or preview HTTPS URL.");
   }
   if (url.username || url.password) {
-    throw new HostedError(400, "input.invalid_url", "Blocked for safety: browser URLs cannot include credentials. Use a public page, or connect an authenticated browsing session when that beta is available.");
+    throw new HostedError(400, "input.invalid_url", "Blocked for safety: browser URLs cannot include credentials. Use a public page, or open an Agent Browser live session when a human needs to sign in.");
   }
 
   const hostname = normalizedHostname(url.hostname);
@@ -3334,6 +5026,12 @@ type RequiredLiveBindings = HostedEnv & {
 };
 
 function requiredBindingsForCapability(capability: CapabilityName): RequiredBindingName[] {
+  if (BROWSER_SESSION_AUTH_CAPABILITIES.has(capability)) {
+    return ["DB"];
+  }
+  if (BROWSER_SESSION_CONTROL_CAPABILITIES.has(capability)) {
+    return ["DB", "ARTIFACTS", "BROWSER"];
+  }
   if (capability === "browser.agent_task") {
     return ["DB", "ARTIFACTS", "BROWSER", "BROWSER_AGENT_WORKFLOW"];
   }
@@ -4802,26 +6500,27 @@ async function enforceQuota(
     throw new HostedError(403, "quota.plan_denied", `${capability} is not enabled for the active vc-tools plan.`);
   }
 
-  if (input.kind === "browser") {
-    const maxBrowserSeconds = capability === "browser.agent_task"
+  if (input.kind === "browser" || input.kind === "browser-session") {
+    const maxBrowserSeconds = isBrowserSessionJobCapability(capability)
       ? plan.limits.browser.maxBrowserSessionSeconds
       : plan.limits.browser.maxBrowserSecondsPerRun;
     const maxRunMs = maxBrowserSeconds * 1000;
-    if (input.timeoutMs > maxRunMs) {
+    const requestedTimeoutMs = input.timeoutMs ?? 0;
+    if (requestedTimeoutMs > maxRunMs) {
       throw new HostedError(429, "quota.browser_run_timeout_exceeded", `Browser run timeout exceeds the ${plan.name} plan cap of ${maxBrowserSeconds}s.`);
     }
-    if (capability === "browser.agent_task") {
+    if (isBrowserSessionJobCapability(capability)) {
       if (!plan.limits.browser.allowBrowserSessions || plan.limits.browser.maxConcurrentBrowserSessionsPerUser <= 0) {
-        throw new HostedError(403, "quota.plan_denied", "Browser agent tasks are not enabled for the active vc-tools plan.");
+        throw new HostedError(403, "quota.plan_denied", "Agent Browser sessions are not enabled for the active vc-tools plan.");
       }
       const activeBrowserSessionRow = await db.prepare(
-        "SELECT COUNT(1) AS count_value FROM jobs WHERE actor_id = ? AND capability = 'browser.agent_task' AND status IN ('queued', 'running')"
+        "SELECT COUNT(1) AS count_value FROM jobs WHERE actor_id = ? AND capability IN ('browser.agent_task', 'browser.session_open') AND status IN ('queued', 'running')"
       ).bind(auth.actorId).first<{ count_value: number }>();
       if (Number(activeBrowserSessionRow?.count_value ?? 0) >= plan.limits.browser.maxConcurrentBrowserSessionsPerUser) {
-        throw new HostedError(429, "quota.browser_session_concurrent_jobs_exceeded", `Browser agent task concurrency is full for the active ${plan.name} plan.`);
+        throw new HostedError(429, "quota.browser_session_concurrent_jobs_exceeded", `Agent Browser session concurrency is full for the active ${plan.name} plan.`);
       }
     }
-    if (capability === "browser.crawl_site") {
+    if (input.kind === "browser" && capability === "browser.crawl_site") {
       if (plan.posture.crawl === "disabled") {
         throw new HostedError(403, "quota.plan_denied", "Public crawl is not enabled for the active vc-tools plan.");
       }
@@ -4884,12 +6583,12 @@ async function enforceQuota(
     }
   }
 
-  if (input.kind === "browser") {
+  if (input.kind === "browser" || input.kind === "browser-session") {
     const [monthlyBrowserMinutes, dailyBrowserMinutes] = await Promise.all([
       sumUsage(db, auth, "browser-minute", monthStart),
       sumUsage(db, auth, "browser-minute", dayStart)
     ]);
-    const runSeconds = Math.ceil(input.timeoutMs / 1000);
+    const runSeconds = Math.ceil((input.timeoutMs ?? 0) / 1000);
     if (monthlyBrowserMinutes * 60 + runSeconds > plan.limits.browser.monthlyBrowserSeconds) {
       throw new HostedError(429, "quota.browser_monthly_seconds_exceeded", "Monthly Browser Run seconds quota has been reached for the active vc-tools plan.");
     }
@@ -4898,7 +6597,7 @@ async function enforceQuota(
     }
   }
 
-  if (input.kind === "browser" || input.kind === "sandbox") {
+  if (input.kind === "browser" || input.kind === "browser-session" || input.kind === "sandbox") {
     await assertArtifactStorageAvailable(db, auth.actorId, plan, 1);
   }
 }
@@ -4977,7 +6676,7 @@ async function insertQueuedJobWithQuotaReservation(db: D1Database, job: QueuedJo
     SELECT ?, ?, ?, ?, 'queued', ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?
     WHERE
       (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND status IN ('queued', 'running')) < ?
-      AND (? = 0 OR (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND capability = 'browser.agent_task' AND status IN ('queued', 'running')) < ?)
+      AND (? = 0 OR (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND capability IN ('browser.agent_task', 'browser.session_open') AND status IN ('queued', 'running')) < ?)
       AND (? = 0 OR (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND capability LIKE 'sandbox.%' AND status IN ('queued', 'running')) < ?)
       AND (SELECT COALESCE(SUM(reserved_credits), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?
       AND (SELECT COALESCE(SUM(reserved_credits), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?
@@ -5000,7 +6699,7 @@ async function insertQueuedJobWithQuotaReservation(db: D1Database, job: QueuedJo
     job.reservedSandboxSeconds,
     job.actorId,
     plan.limits.maxConcurrentRuns,
-    job.capability === "browser.agent_task" ? 1 : 0,
+    isBrowserSessionJobCapability(job.capability) ? 1 : 0,
     job.actorId,
     plan.limits.browser.maxConcurrentBrowserSessionsPerUser,
     job.input.kind === "sandbox" ? 1 : 0,
@@ -5029,6 +6728,75 @@ async function insertQueuedJobWithQuotaReservation(db: D1Database, job: QueuedJo
     monthStart,
     job.reservedSandboxSeconds,
     plan.limits.sandboxMinutesMonthly * 60
+  ).run();
+  return d1ChangedRows(result) > 0;
+}
+
+async function insertRunningBrowserSessionWithQuotaReservation(db: D1Database, job: QueuedJobReservation, plan: Plan): Promise<boolean> {
+  const monthStart = startOfMonthIso();
+  const dayStart = startOfDayIso();
+  const result = await db.prepare(
+    `INSERT INTO jobs (
+      id,
+      actor_id,
+      plan_name,
+      capability,
+      status,
+      input_json,
+      provider_mode,
+      queue_global_ahead,
+      queue_actor_ahead,
+      queue_delay_seconds,
+      created_at,
+      updated_at,
+      started_at,
+      reserved_credits,
+      reserved_browser_seconds,
+      reserved_sandbox_seconds
+    )
+    SELECT ?, ?, ?, ?, 'running', ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?
+    WHERE
+      (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND status IN ('queued', 'running')) < ?
+      AND (SELECT COUNT(1) FROM jobs WHERE actor_id = ? AND capability IN ('browser.agent_task', 'browser.session_open') AND status IN ('queued', 'running')) < ?
+      AND (SELECT COALESCE(SUM(reserved_credits), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?
+      AND (SELECT COALESCE(SUM(reserved_credits), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?
+      AND (SELECT COALESCE(SUM(reserved_browser_seconds), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?
+      AND (SELECT COALESCE(SUM(reserved_browser_seconds), 0) FROM jobs WHERE actor_id = ? AND created_at >= ?) + ? <= ?`
+  ).bind(
+    job.id,
+    job.actorId,
+    job.planName,
+    job.capability,
+    JSON.stringify(job.input),
+    job.queue.globalQueuedAhead,
+    job.queue.actorQueuedAhead,
+    job.queue.fairDelaySeconds,
+    job.createdAt,
+    job.updatedAt,
+    job.createdAt,
+    job.reservedCredits,
+    job.reservedBrowserSeconds,
+    job.reservedSandboxSeconds,
+    job.actorId,
+    plan.limits.maxConcurrentRuns,
+    job.actorId,
+    plan.limits.browser.maxConcurrentBrowserSessionsPerUser,
+    job.actorId,
+    monthStart,
+    job.reservedCredits,
+    plan.limits.monthlyCredits,
+    job.actorId,
+    dayStart,
+    job.reservedCredits,
+    plan.limits.dailyCredits,
+    job.actorId,
+    monthStart,
+    job.reservedBrowserSeconds,
+    plan.limits.browser.monthlyBrowserSeconds,
+    job.actorId,
+    dayStart,
+    job.reservedBrowserSeconds,
+    plan.limits.browser.dailyBrowserSeconds
   ).run();
   return d1ChangedRows(result) > 0;
 }
@@ -5269,7 +7037,7 @@ function jobRowToPublic(row: JobRow): Record<string, unknown> {
     plan: row.plan_name,
     capability: row.capability,
     status: row.status,
-    result: safeJson(row.result_json),
+    result: publicJobResult(row),
     error: row.error_code ? { code: row.error_code, message: row.error_message } : undefined,
     queue: {
       globalQueuedAhead: Number(row.queue_global_ahead ?? 0),
@@ -5283,6 +7051,19 @@ function jobRowToPublic(row: JobRow): Record<string, unknown> {
     completedAt: row.completed_at,
     canceledAt: row.canceled_at
   };
+}
+
+function publicJobResult(row: JobRow): unknown {
+  const result = safeJson(row.result_json);
+  if (row.capability !== "browser.session_open" || !isRecord(result)) {
+    return result;
+  }
+  const {
+    providerSessionId: _providerSessionId,
+    handoffTokenHash: _handoffTokenHash,
+    ...publicResult
+  } = result;
+  return publicResult;
 }
 
 async function listArtifacts(db: D1Database, auth: AuthContext, env: HostedEnv, limit: number): Promise<Record<string, unknown>[]> {
@@ -5632,7 +7413,7 @@ async function usageSnapshot(db: D1Database, env: HostedEnv, auth: AuthContext, 
   const dailyBrowserMinutes = await sumUsage(db, auth, "browser-minute", dayStart);
   const sandboxMinutes = await sumUsage(db, auth, "sandbox-compute-minute", monthStart);
   const activeRuns = await countActiveJobs(db, auth, "%");
-  const activeBrowserSessions = await countActiveJobs(db, auth, "browser.agent_task");
+  const activeBrowserSessions = await countActiveBrowserSessions(db, auth);
   const activeSandboxJobs = await countActiveJobs(db, auth, "sandbox.%");
   const storage = await db.prepare(
     "SELECT COALESCE(SUM(bytes), 0) AS bytes FROM artifacts WHERE actor_id = ? AND (expires_at IS NULL OR expires_at > ?)"
@@ -5805,6 +7586,15 @@ async function countActiveJobs(db: D1Database, auth: AuthContext, pattern: strin
     "SELECT COUNT(1) AS count_value FROM jobs WHERE actor_id = ? AND capability LIKE ? AND status IN ('queued', 'running')"
   )
     .bind(auth.actorId, pattern)
+    .first<{ count_value: number }>();
+  return Number(row?.count_value ?? 0);
+}
+
+async function countActiveBrowserSessions(db: D1Database, auth: AuthContext): Promise<number> {
+  const row = await db.prepare(
+    "SELECT COUNT(1) AS count_value FROM jobs WHERE actor_id = ? AND capability IN ('browser.agent_task', 'browser.session_open') AND status IN ('queued', 'running')"
+  )
+    .bind(auth.actorId)
     .first<{ count_value: number }>();
   return Number(row?.count_value ?? 0);
 }
@@ -6192,7 +7982,7 @@ function corsHeaders(request: Request): Record<string, string> {
   return {
     "access-control-allow-origin": origin && origin.endsWith(".vibecodr.space") ? origin : "https://vibecodr.space",
     "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": "authorization,content-type",
+    "access-control-allow-headers": "authorization,content-type,x-vibecodr-handoff-token",
     "vary": "Origin"
   };
 }
@@ -6223,6 +8013,14 @@ function capabilityFromToolName(value: string): CapabilityName | undefined {
   return CAPABILITY_ALIASES[trimmed];
 }
 
+function isBrowserSessionControlCapability(capability: CapabilityName): boolean {
+  return BROWSER_SESSION_CONTROL_CAPABILITIES.has(capability);
+}
+
+function isBrowserSessionJobCapability(capability: CapabilityName): boolean {
+  return BROWSER_SESSION_JOB_CAPABILITIES.has(capability);
+}
+
 function titleForAgentTool(name: string, capability: CapabilityName): string {
   return ({
     "browser.render": "Render Browser Page",
@@ -6231,6 +8029,18 @@ function titleForAgentTool(name: string, capability: CapabilityName): string {
     "browser.pdf": "Create Browser PDF",
     "browser.crawl": "Crawl Public Site",
     "browser.snapshot": "Capture Browser Snapshot",
+    "browser.session.open": "Open Agent Browser Session",
+    "browser.session.observe": "Observe Agent Browser Session",
+    "browser.session.goto": "Navigate Agent Browser Session",
+    "browser.session.click": "Click In Agent Browser Session",
+    "browser.session.type": "Type In Agent Browser Session",
+    "browser.session.scroll": "Scroll Agent Browser Session",
+    "browser.session.wait": "Wait In Agent Browser Session",
+    "browser.session.auth.request": "Open Agent Browser Live Control",
+    "browser.session.auth.status": "Read Agent Browser Live Control",
+    "browser.session.auth.complete": "Return Agent Browser Control",
+    "browser.session.auth.revoke": "Revoke Agent Browser Live Control",
+    "browser.session.close": "Close Agent Browser Session",
     "computer.run": "Run On Agent Computer",
     "computer.test": "Test On Agent Computer",
     "proof.get": "Get Saved Proof",
@@ -6248,6 +8058,18 @@ function titleForCapability(name: CapabilityName): string {
     "browser.render_pdf": "Render PDF",
     "browser.crawl_site": "Crawl Site",
     "browser.agent_task": "Agent Browser Task",
+    "browser.session_open": "Open Agent Browser Session",
+    "browser.session_observe": "Observe Agent Browser Session",
+    "browser.session_navigate": "Navigate Agent Browser Session",
+    "browser.session_click": "Click In Agent Browser Session",
+    "browser.session_type": "Type In Agent Browser Session",
+    "browser.session_scroll": "Scroll Agent Browser Session",
+    "browser.session_wait": "Wait In Agent Browser Session",
+    "browser.session_auth_request": "Open Agent Browser Live Control",
+    "browser.session_auth_status": "Read Agent Browser Live Control",
+    "browser.session_auth_complete": "Return Agent Browser Control",
+    "browser.session_auth_revoke": "Revoke Agent Browser Live Control",
+    "browser.session_close": "Close Agent Browser Session",
     "sandbox.run_command": "Run Sandbox Command",
     "sandbox.run_tests": "Run Sandbox Tests",
     "artifact.create": "Create Artifact",
@@ -6266,6 +8088,18 @@ function descriptionForAgentTool(name: string, capability: CapabilityName): stri
     "browser.pdf": "Render a PDF from a public HTTPS page within quota and retention policy.",
     "browser.crawl": "Crawl a bounded public HTTPS site and save the result as proof.",
     "browser.snapshot": "Capture a bounded hosted Browser page-state snapshot. This does not prompt a model or return a chat answer.",
+    "browser.session.open": "Open a hosted public-HTTPS Agent Browser session and return the first screenshot and page state.",
+    "browser.session.observe": "Get the current screenshot and page state from an open Agent Browser session.",
+    "browser.session.goto": "Navigate an open Agent Browser session to another public HTTPS URL.",
+    "browser.session.click": "Click a selector in an open Agent Browser session, then return a fresh observation.",
+    "browser.session.type": "Type text into a selector in an open Agent Browser session, then return a fresh observation.",
+    "browser.session.scroll": "Scroll an open Agent Browser session, then return a fresh observation.",
+    "browser.session.wait": "Wait briefly in an open Agent Browser session, then return a fresh observation.",
+    "browser.session.auth.request": "Mint a short-lived Vibecodr live-control link for an open hosted browser, starting in human control for login or other sensitive steps.",
+    "browser.session.auth.status": "Read whether an Agent Browser live link is public, under human control, agent-ready, expired, or revoked.",
+    "browser.session.auth.complete": "Give control back to the agent while keeping the same hosted browser live link available.",
+    "browser.session.auth.revoke": "Revoke the live-control link and prevent continuation with human-touched browser state.",
+    "browser.session.close": "Close an open Agent Browser session and save a final proof snapshot.",
     "computer.run": "Submit a bounded command to the hosted Agent Computer. The command is never executed on the user's local machine.",
     "computer.test": "Submit a bounded test command to the hosted Agent Computer. Public HTTP(S) is available by default; private/internal destinations stay blocked.",
     "proof.get": "Read saved proof/artifact metadata for the authenticated account.",
@@ -6283,6 +8117,18 @@ function descriptionForCapability(name: CapabilityName): string {
     "browser.render_pdf": "Render a PDF from an HTTPS public URL within quota and retention policy.",
     "browser.crawl_site": "Crawl a bounded public HTTPS site and return a hosted artifact without authenticated browsing by default.",
     "browser.agent_task": "Run a paid Browser Session-style task with bounded actions: Creator up to 20 minutes, Pro up to 1 hour, and 10 minute idle closure.",
+    "browser.session_open": "Open a real hosted Agent Browser session for public HTTPS pages, returning screenshot proof and a session id.",
+    "browser.session_observe": "Observe the current state of an open hosted Agent Browser session.",
+    "browser.session_navigate": "Navigate an open hosted Agent Browser session to another public HTTPS page.",
+    "browser.session_click": "Click a CSS selector in an open hosted Agent Browser session.",
+    "browser.session_type": "Type text into a CSS selector in an open hosted Agent Browser session.",
+    "browser.session_scroll": "Scroll an open hosted Agent Browser session.",
+    "browser.session_wait": "Wait briefly in an open hosted Agent Browser session.",
+    "browser.session_auth_request": "Create a Vibecodr-owned live-control link for an open hosted Agent Browser session.",
+    "browser.session_auth_status": "Read the live-control state for an open hosted Agent Browser session.",
+    "browser.session_auth_complete": "Give control back so agent controls may resume.",
+    "browser.session_auth_revoke": "Revoke human live control for an open hosted Agent Browser session.",
+    "browser.session_close": "Close an open hosted Agent Browser session and save final proof.",
     "sandbox.run_command": "Submit a bounded command for isolated hosted Agent Computer execution with public HTTP(S) egress and private/internal destination blocking.",
     "sandbox.run_tests": "Submit a bounded test command for isolated hosted Agent Computer execution with public HTTP(S) egress and private/internal destination blocking.",
     "artifact.create": "Store a generated output artifact subject to workspace retention policy.",
@@ -6313,6 +8159,94 @@ function inputSchemaForCapability(name: CapabilityName): Record<string, unknown>
     return {
       type: "object",
       properties: {},
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_open") {
+    return {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "HTTPS public URL. Localhost, private IPs, URL credentials, and internal hosts are denied." },
+        timeoutMs: { type: "integer", minimum: 1000, maximum: MAX_BROWSER_AGENT_TASK_TIMEOUT_MS },
+        idleTimeoutMs: { type: "integer", minimum: 1000, maximum: DEFAULT_BROWSER_AGENT_IDLE_TIMEOUT_MS }
+      },
+      required: ["url"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_observe" || name === "browser.session_close") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "Vibecodr Agent Browser session id returned by browser.session.open." }
+      },
+      required: ["sessionId"],
+      additionalProperties: false
+    };
+  }
+  if (BROWSER_SESSION_AUTH_CAPABILITIES.has(name)) {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string", description: "Vibecodr Agent Browser session id returned by browser.session.open." }
+      },
+      required: ["sessionId"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_navigate") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        url: { type: "string", description: "HTTPS public URL. Localhost, private IPs, URL credentials, and internal hosts are denied." }
+      },
+      required: ["sessionId", "url"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_click") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        selector: { type: "string", maxLength: 500 }
+      },
+      required: ["sessionId", "selector"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_type") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        selector: { type: "string", maxLength: 500 },
+        text: { type: "string", maxLength: 2000 }
+      },
+      required: ["sessionId", "selector", "text"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_scroll") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        deltaY: { type: "integer", minimum: -10000, maximum: 10000, default: 800 }
+      },
+      required: ["sessionId"],
+      additionalProperties: false
+    };
+  }
+  if (name === "browser.session_wait") {
+    return {
+      type: "object",
+      properties: {
+        sessionId: { type: "string" },
+        ms: { type: "integer", minimum: 1, maximum: 30000, default: 1000 }
+      },
+      required: ["sessionId"],
       additionalProperties: false
     };
   }
@@ -6657,6 +8591,20 @@ function addDaysIso(input: string, days: number): string {
   const date = new Date(input);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString();
+}
+
+function addMillisecondsIso(input: string, milliseconds: number): string {
+  const date = new Date(input);
+  const start = Number.isNaN(date.getTime()) ? Date.now() : date.getTime();
+  return new Date(start + Math.max(0, milliseconds)).toISOString();
+}
+
+function minIso(left: string, right: string): string {
+  const leftTime = Date.parse(left);
+  const rightTime = Date.parse(right);
+  if (Number.isNaN(leftTime)) return right;
+  if (Number.isNaN(rightTime)) return left;
+  return leftTime <= rightTime ? left : right;
 }
 
 function subtractMinutesIso(input: string, minutes: number): string {

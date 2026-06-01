@@ -552,7 +552,7 @@ consented private-network connector.
 ```text
 Blocked for safety: browser calls cannot include cookies, credentials, auth
 headers, storage state, or secrets. Use a public page, or connect an
-authenticated browsing session when that beta is available.
+Agent Browser live session when a human needs to sign in.
 ```
 
 Acceptance tests:
@@ -979,4 +979,3 @@ required.
   `--dry-run` to plan without writing.
 - `vc-tools dashboard` opens the dashboard URL in the local browser unless
   `--no-open`, `--json`, `--quiet`, or `--no-input` is set.
-

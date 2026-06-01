@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -923,6 +923,223 @@ test("browser snapshot stays a no-prompt capture command", async () => {
   }
 });
 
+test("browser session commands call the live Agent Browser session API", async () => {
+  const opened = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "open",
+    "https://example.com",
+    "--timeout-ms",
+    "1200000",
+    "--idle-timeout-ms",
+    "600000"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions",
+      response: (request: RecordedRequest) => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running" },
+        observation: { screenshot: { id: "art_session_open", contentType: "image/png" } },
+        echo: request.body
+      })
+    }
+  ]);
+  try {
+    assert.equal(opened.code, 0);
+    const body = JSON.parse(opened.stdout);
+    assert.deepEqual(body.data.echo, {
+      url: "https://example.com/",
+      timeoutMs: 1200000,
+      idleTimeoutMs: 600000
+    });
+  } finally {
+    await opened.cleanup();
+  }
+
+  const clicked = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "click",
+    "job_browser_session",
+    "--selector",
+    "button.start"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions/job_browser_session/actions",
+      response: (request: RecordedRequest) => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running" },
+        action: { action: "click", ok: true },
+        observation: { screenshot: { id: "art_session_click", contentType: "image/png" } },
+        echo: request.body
+      })
+    }
+  ]);
+  try {
+    assert.equal(clicked.code, 0);
+    const body = JSON.parse(clicked.stdout);
+    assert.deepEqual(body.data.echo, {
+      action: "click",
+      selector: "button.start"
+    });
+  } finally {
+    await clicked.cleanup();
+  }
+
+  const handoff = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "auth",
+    "job_browser_session",
+    "--no-open"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions/job_browser_session/auth",
+      response: () => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running", auth: { status: "human_control" } },
+        auth: { status: "human_control", handoffUrl: "https://tools.vibecodr.space/browser/handoff/job_browser_session?token=vbha_test" }
+      })
+    }
+  ]);
+  try {
+    assert.equal(handoff.code, 0);
+    const body = JSON.parse(handoff.stdout);
+    assert.equal(body.data.auth.status, "human_control");
+    assert.equal(body.data.auth.handoffUrl, "https://tools.vibecodr.space/browser/handoff/job_browser_session?token=vbha_test");
+  } finally {
+    await handoff.cleanup();
+  }
+
+  const debugLive = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "live",
+    "job_browser_session",
+    "--debug",
+    "--no-open"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions/job_browser_session/live",
+      response: (request: RecordedRequest) => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running", auth: { status: "public" } },
+        auth: {
+          status: "public",
+          viewMode: "devtools",
+          handoffUrl: "https://vibecodr.space/agent-browser/live/job_browser_session#token=vbha_test&view=devtools"
+        },
+        requestUrl: request.url
+      })
+    }
+  ]);
+  try {
+    assert.equal(debugLive.code, 0);
+    const body = JSON.parse(debugLive.stdout);
+    assert.equal(body.data.auth.viewMode, "devtools");
+    assert.equal(body.data.requestUrl, "http://localhost:8787/v1/browser/sessions/job_browser_session/live?view=devtools");
+  } finally {
+    await debugLive.cleanup();
+  }
+
+  const status = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "auth-status",
+    "job_browser_session"
+  ], [
+    {
+      method: "GET",
+      path: "/v1/browser/sessions/job_browser_session/auth",
+      response: () => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running", auth: { status: "auth_ready" } },
+        auth: { status: "auth_ready" }
+      })
+    }
+  ]);
+  try {
+    assert.equal(status.code, 0);
+    const body = JSON.parse(status.stdout);
+    assert.equal(body.data.auth.status, "auth_ready");
+  } finally {
+    await status.cleanup();
+  }
+
+  const completed = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "auth-complete",
+    "job_browser_session"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions/job_browser_session/auth/complete",
+      response: () => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running", auth: { status: "auth_ready" } },
+        auth: { status: "auth_ready" }
+      })
+    }
+  ]);
+  try {
+    assert.equal(completed.code, 0);
+    const body = JSON.parse(completed.stdout);
+    assert.equal(body.data.auth.status, "auth_ready");
+  } finally {
+    await completed.cleanup();
+  }
+
+  const revoked = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "session",
+    "auth-revoke",
+    "job_browser_session"
+  ], [
+    {
+      method: "POST",
+      path: "/v1/browser/sessions/job_browser_session/auth/revoke",
+      response: () => ({
+        id: "job_browser_session",
+        session: { id: "job_browser_session", status: "running", auth: { status: "revoked" } },
+        auth: { status: "revoked" }
+      })
+    }
+  ]);
+  try {
+    assert.equal(revoked.code, 0);
+    const body = JSON.parse(revoked.stdout);
+    assert.equal(body.data.auth.status, "revoked");
+  } finally {
+    await revoked.cleanup();
+  }
+});
+
 test("tools test submits canonical crawl capability payloads", async () => {
   const result = await runWithMockApi([
     "--json",
@@ -1105,6 +1322,50 @@ test("agent-computer aliases wait and save proof without requiring artifact ids"
     assert.deepEqual([...await readFile(body.data.proof.path)], [1, 2, 3]);
   } finally {
     await result.cleanup();
+  }
+
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "vibecodr-cli-outside-"));
+  const workspace = path.join(tempRoot, "workspace");
+  const outside = path.join(tempRoot, "scratch");
+  await mkdir(workspace, { recursive: true });
+  await mkdir(outside, { recursive: true });
+  const relocated = await runWithMockApi([
+    "--json",
+    "--token",
+    token,
+    "browser",
+    "screenshot",
+    "https://example.com",
+    "--out",
+    outside
+  ], [
+    { method: "POST", path: "/v1/tools/test", response: { id: "job_screen", status: "queued" } },
+    { method: "GET", path: "/v1/jobs/job_screen", response: { id: "job_screen", status: "completed", result: { artifactId: "art_screen" } } },
+    {
+      method: "GET",
+      path: "/v1/artifacts/art_screen/download",
+      response: new Uint8Array([1, 2, 3]),
+      headers: {
+        "content-type": "image/png",
+        "content-disposition": "attachment; filename=\"homepage.png\""
+      }
+    }
+  ], { cwd: workspace });
+  try {
+    assert.equal(relocated.code, 0);
+    assert.equal(relocated.requests.length, 3);
+    const body = JSON.parse(relocated.stdout);
+    const savedPath = String(body.data.proof.path);
+    assert.equal(path.basename(savedPath), "homepage.png");
+    assert.equal(path.relative(path.join(workspace, ".vibecodr", "browser-artifacts"), savedPath).startsWith(".."), false);
+    assert.deepEqual([...await readFile(savedPath)], [1, 2, 3]);
+    assert.match(JSON.stringify(body.warnings), /outside this workspace/);
+    assert.match(JSON.stringify(body.warnings), /\.\/\.vibecodr\/browser-artifacts\//);
+    assert.match(JSON.stringify(body.warnings), /gitignored/);
+    assert.doesNotMatch(relocated.stdout, new RegExp(escapeRegex(outside)));
+  } finally {
+    await relocated.cleanup();
+    await rm(tempRoot, { recursive: true, force: true });
   }
 
   const local = await runWithMockApi([
