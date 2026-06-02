@@ -75,6 +75,29 @@ vibecodr mcp call get_account_capabilities --input-json '{}' --json --non-intera
 vibecodr status --json --non-interactive
 ```
 
+### Agents on a server (headless, no browser)
+
+An AI agent running on a server (SSH, CI, a headless VM) should drive the hosted
+tools through the CLI rather than wiring a hosted MCP URL into its own MCP
+client — the MCP URL is OAuth-gated and its browser sign-in cannot complete on a
+headless box.
+
+```bash
+# Sign in once with no browser (approve the printed code from your phone).
+# Set VC_TOOLS_CREDENTIAL_STORE=file first if the box has no system keyring.
+export VC_TOOLS_CREDENTIAL_STORE=file
+vibecodr login agent --no-browser
+
+# Then run the hosted tools directly; the CLI holds the credential.
+vibecodr doctor --json            # the "agent" field lists the full recipe
+vibecodr browser screenshot https://example.com --local
+vibecodr computer run "npm test"
+vibecodr mcp call <tool> --input-json '{}'
+```
+
+Run `vibecodr status` or `vibecodr doctor` (or their `--json`) any time for the
+recipe and the headless sign-in steps.
+
 ## Surfaces
 
 The CLI talks to two hosted endpoints. Every command targets exactly one of them:

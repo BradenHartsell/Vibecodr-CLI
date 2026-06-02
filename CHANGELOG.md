@@ -2,6 +2,14 @@
 
 Pre-1.0.0 history for the `@vibecodr/cli@0.2.x` and `0.1.x` lines lives at [`docs/legacy/CHANGELOG-mcp-cli.md`](docs/legacy/CHANGELOG-mcp-cli.md). The `@vibecodr/vc-tools@0.1.x` line was the other half of the May 2026 merge; its source history is preserved in the archived [`BradenHartsell/vc-tools`](https://github.com/BradenHartsell/vc-tools) repository.
 
+## 1.0.16
+
+Helps an agent running on a server (no browser) discover that it can drive the hosted tools through the CLI.
+
+- `vibecodr status` and `vibecodr doctor` now include an `agent` recipe in their `--json` output (and `vibecodr doctor` shows a short version in its human summary): the `vibecodr browser` / `computer` / `mcp call` commands to run, plus the no-browser sign-in (`vibecodr login agent --no-browser`, with `VC_TOOLS_CREDENTIAL_STORE=file` when there is no system keyring).
+- When the Agent Computer is not signed in, `status` and `doctor` now offer `vibecodr login agent --no-browser` alongside `vibecodr start`, so an agent on a headless box is not steered into a browser flow.
+- The README and `docs/auth.md` now document the headless "drive the hosted tools through the CLI" path instead of pointing headless setups at an MCP client's browser OAuth.
+
 ## 1.0.14
 
 Renames the note-attaching snapshot helper to match what it does.

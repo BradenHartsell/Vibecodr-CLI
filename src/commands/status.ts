@@ -5,6 +5,7 @@ import { InstallManifestStore } from "../storage/install-manifest.js";
 import type { BrokeredCredential, CredentialEndpoint } from "../auth/credential-broker.js";
 import type { InstallManifestEntry } from "../types/install.js";
 import type { CommandContext } from "./context.js";
+import { agentRecipePayload } from "../app/agent-recipe.js";
 
 type InstallStatus = InstallManifestEntry & {
   status: "configured" | "missing" | "external";
@@ -98,7 +99,7 @@ function statusNextStep(credentialSurfaces: CredentialSurfaceStatus[]): string {
   const agentComputer = credentialSurfaces.find((surface) => surface.surface === "agentComputer");
   const mcpGateway = credentialSurfaces.find((surface) => surface.surface === "mcpGateway");
   if (!agentComputer?.authenticated) {
-    return "Next: run `vibecodr start` to approve the Agent Computer account connection.";
+    return "Next: run `vibecodr start`, or on a headless server `vibecodr login agent --no-browser`, to approve the Agent Computer account connection.";
   }
   if (!mcpGateway?.authenticated) {
     return "Next: run `vibecodr login` only if you use publishing, uploads, Pulses, or MCP Gateway tools.";
@@ -171,6 +172,7 @@ export async function runStatusCommand(args: string[], context: CommandContext):
     expiresAt: session?.expiresAt,
     credentialSurfaces,
     installs,
+    agent: agentRecipePayload(),
     ...(probe ? { probe } : {})
   };
   const humanLines = [

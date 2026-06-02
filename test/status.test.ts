@@ -211,3 +211,54 @@ test("status explains stale MCP access token expiry when OAuth can refresh", asy
   assert.ok(humanLines.some((line) => line.includes("the next MCP Gateway call will refresh it")));
   assert.equal(humanLines.some((line) => line.includes("MCP session expires:")), false);
 });
+
+test("status exposes the agent CLI recipe and a no-browser sign-in for headless agents", async () => {
+  let payload: Record<string, unknown> | undefined;
+  const humanLines: string[] = [];
+  await runStatusCommand([], {
+    globalOptions: {
+      profile: "default",
+      json: false,
+      verbose: false,
+      nonInteractive: false
+    },
+    output: {
+      success(value: Record<string, unknown>, lines: string[]) {
+        payload = value;
+        humanLines.push(...lines);
+      }
+    },
+    tokenManager: {
+      resolveProfile: async () => ({
+        profileName: "default",
+        profile: {
+          serverUrl: "https://openai.vibecodr.space/mcp",
+          browserMode: "print",
+          registrationMode: "auto",
+          defaultInstallScope: "user",
+          logLevel: "normal"
+        },
+        serverUrl: "https://openai.vibecodr.space/mcp"
+      }),
+      getSession: async () => undefined,
+      sessionState: () => "none"
+    },
+    configStore: {} as never,
+    secretStore: {} as never,
+    runtimeClient: {} as never,
+    credentialBroker: {
+      getCredentialForEndpoint: async () => undefined
+    }
+  } as never);
+
+  const agent = payload?.["agent"] as
+    | { cliCommands?: unknown[]; headless?: { signIn?: string } }
+    | undefined;
+  assert.ok(agent, "status --json should include an agent recipe block");
+  assert.ok(Array.isArray(agent?.cliCommands) && agent.cliCommands.length > 0);
+  assert.equal(agent?.headless?.signIn, "vibecodr login agent --no-browser");
+  // Unauthenticated Agent Computer: the Next step keeps `vibecodr start` and also
+  // offers the no-browser path so an agent on a server is not steered into a browser.
+  assert.ok(humanLines.some((line) => line.includes("Next: run `vibecodr start`")));
+  assert.ok(humanLines.some((line) => line.includes("vibecodr login agent --no-browser")));
+});

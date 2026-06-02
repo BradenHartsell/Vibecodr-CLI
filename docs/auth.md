@@ -41,7 +41,7 @@ Supported OS credential stores:
 - Windows: Credential Manager
 - Linux: Secret Service through a desktop keyring such as GNOME Keyring or KWallet
 
-Linux systems need a running, unlocked keyring on the current D-Bus session. Headless Linux should use a real Secret Service setup for persistent CLI login, or let the target MCP client own its own OAuth flow instead of storing CLI tokens.
+Linux systems need a running, unlocked keyring on the current D-Bus session. On a headless server with no keyring, set `VC_TOOLS_CREDENTIAL_STORE=file` to persist the login to disk (local automation only), sign in without a browser using `vibecodr login agent --no-browser`, and drive the hosted tools through the CLI (`vibecodr browser`, `vibecodr computer`, `vibecodr mcp call`) — run `vibecodr doctor` for the full recipe. Avoid the MCP-client OAuth path on a headless box: its browser sign-in cannot complete there.
 
 ## Registration modes
 

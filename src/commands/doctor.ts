@@ -4,6 +4,7 @@ import { EXIT_CODES } from "../cli/errors.js";
 import { showHelpIfRequested } from "./help.js";
 import type { CommandContext } from "./context.js";
 import type { CredentialEndpoint } from "../auth/credential-broker.js";
+import { agentRecipePayload, agentRecipeHumanLines } from "../app/agent-recipe.js";
 
 type DoctorCheck = Awaited<ReturnType<typeof runDoctor>>[number];
 
@@ -61,7 +62,7 @@ function nextStepForCheck(check: DoctorCheck): string | undefined {
     return "Run `vibecodr login` for publishing, uploads, Pulses, and MCP Gateway tools.";
   }
   if (check.id === "agent-computer-credential") {
-    return "Run `vibecodr start` to approve the Agent Computer account connection.";
+    return "Run `vibecodr start`, or on a headless server `vibecodr login agent --no-browser`, to approve the Agent Computer account connection.";
   }
   if (check.id === "refresh-token") {
     return "Run `vibecodr login` to refresh this CLI session.";
@@ -89,7 +90,9 @@ function doctorHumanLines(checks: DoctorCheck[]): string[] {
     firstAction ? `Next: ${firstAction}` : "Next: run `vibecodr status` to see what is connected.",
     "",
     "Details:",
-    ...checks.map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.summary}`)
+    ...checks.map((check) => `[${check.status.toUpperCase()}] ${check.id}: ${check.summary}`),
+    "",
+    ...agentRecipeHumanLines()
   ];
 }
 
@@ -112,7 +115,8 @@ export async function runDoctorCommand(args: string[], context: CommandContext):
     {
       schemaVersion: 1,
       ok: checks.every((check) => check.status === "pass"),
-      checks
+      checks,
+      agent: agentRecipePayload()
     },
     doctorHumanLines(checks)
   );
